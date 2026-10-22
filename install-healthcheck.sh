@@ -205,7 +205,7 @@ n=$(grep -c . <<<"$errs")
 if [ "$n" -gt 0 ]; then
   new=0
   while [ "$new" -lt 20 ] && IFS= read -r l; do
-    grep -qF "| $BOOT | $l" "$ALERTS" 2>/dev/null && continue
+    grep -qsF "| $BOOT | $l" "$ALERTS" "$STATE/alerts.acked.log" && continue   # acked lines stay acked
     alert "$BOOT | $l"; new=$((new+1))
   done <<<"$errs"
   add WARN kernel "$n error-like lines since boot, latest:"
