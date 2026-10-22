@@ -11,6 +11,7 @@ set -u
 
 STATUS=/run/healthcheck.status
 STATE=/var/lib/healthcheck
+IGNORE=/etc/healthcheck/ignore-units
 LOG=$(mktemp); trap 'rm -f "$LOG"' EXIT
 
 # run a login shell on a pseudo-terminal, the way an SSH login does; print what it shows
@@ -79,11 +80,27 @@ check "ack clears alerts" test ! -s "$STATE/alerts.log"
 check "ack keeps a copy" grep -q 'unclean shutdown' "$STATE/alerts.acked.log"
 echo running > "$STATE/boot_state"
 
+section "failed services and the ignore list"
+check "ignore list created" test -f "$IGNORE"
+printf '[Service]\nType=oneshot\nExecStart=/bin/false\n' > /etc/systemd/system/hc-test-fail.service
+systemctl daemon-reload
+systemctl start hc-test-fail.service 2>/dev/null
+/usr/local/sbin/healthcheck run
+check "failed unit is reported" grep -q '^WARN|services|failed:.*hc-test-fail\.service' "$STATUS"
+check "with a hint on how to hide it" grep -q "hide: add it to $IGNORE" "$STATUS"
+echo 'hc-test-*.service   # glob' >> "$IGNORE"
+/usr/local/sbin/healthcheck run
+check "ignored unit (by glob) is hidden" bash -c "! grep -q 'hc-test-fail' '$STATUS'"
+check "ignored unit is still counted" grep -q '^[A-Z]*|services|.*(1 ignored)$' "$STATUS"
+rm -f /etc/systemd/system/hc-test-fail.service
+systemctl reset-failed hc-test-fail.service 2>/dev/null; systemctl daemon-reload
+
 section "reinstall is idempotent"
 bash "$INSTALLER" "$@" >"$LOG" 2>&1; rc=$?
 check "reinstall exits 0" test "$rc" = 0
 check "no files rewritten" bash -c "! grep -q 'wrote ' '$LOG'"
 check "no backups made" bash -c "! grep -q 'backed up' '$LOG'"
+check "ignore list edits kept" grep -q '^hc-test-' "$IGNORE"
 
 section "uninstall"
 bash "$INSTALLER" --uninstall >"$LOG" 2>&1; rc=$?
@@ -95,7 +112,9 @@ done
 check "timer no longer loaded" bash -c "[ \"\$(systemctl show -p LoadState --value healthcheck.timer)\" = not-found ]"
 check "clean shutdown marked on uninstall" grep -qx clean "$STATE/boot_state"
 check "state kept without --purge" test -d "$STATE"
+check "ignore list kept without --purge" test -f "$IGNORE"
 bash "$INSTALLER" --uninstall --purge >/dev/null 2>&1
 check "--purge removes state" test ! -e "$STATE"
+check "--purge removes the ignore list" test ! -e "$IGNORE"
 
 finish

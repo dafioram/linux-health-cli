@@ -40,7 +40,7 @@ changed ones are backed up as `*.bak.<timestamp>` first.
 | `--no-apt` | don't install smartmontools |
 | `--run-weekly-now` | start the package verification now, in the background |
 | `--uninstall` | remove the scripts and units, but keep the alert history |
-| `--uninstall --purge` | also delete `/var/lib/healthcheck` |
+| `--uninstall --purge` | also delete `/var/lib/healthcheck` and `/etc/healthcheck` |
 
 Clear saved alerts once you've read them with `sudo healthcheck ack`. They are moved
 to `alerts.acked.log`.
@@ -57,7 +57,7 @@ to `alerts.acked.log`.
 | one per mount | `df`: space, then inodes | ⚠ 10% or less free |
 | one per disk | `smartctl` (see below) | see below |
 | `memory` | `MemAvailable` | ⚠ under 10% |
-| `services` | `systemctl --failed` | ⚠ any failed unit |
+| `services` | `systemctl --failed`, minus your [ignore list](#failed-services) | ⚠ any failed unit |
 | `weekly` | `dpkg --verify`, Sundays 03:30 (ignores changed config files) | ⚠ package files that differ from what was installed |
 | `history` | saved alerts from earlier boots | ⚠ any you haven't acknowledged |
 
@@ -100,6 +100,35 @@ Not covered: which mount lives on which disk, NVMe power-on hours and media-erro
 counts, SMART self-test logs, drive temperature, and RAID or pool health (mdadm,
 btrfs, ZFS). The member disks of an mdadm array are still checked one by one.
 
+### Failed services
+
+Any failed systemd unit turns the `services` line into a warning. Many of these are
+harmless one-offs: a message-of-the-day fetch that ran before the network was up, a
+service for hardware the machine doesn't have, a mount for a drive that isn't plugged
+in. In order of preference:
+
+1. **Find out why:** `systemctl status UNIT` and `journalctl -b -u UNIT`.
+2. **It failed once and won't again:** `sudo systemctl reset-failed UNIT`. Failed
+   states also clear on reboot.
+3. **This machine never needs it:** `sudo systemctl mask UNIT`. It won't run again,
+   so it can't fail again.
+4. **It's noise you want to keep running:** add it to `/etc/healthcheck/ignore-units`,
+   one unit name or shell glob per line, `#` for comments:
+
+   ```
+   motd-news.service
+   mnt-*.mount
+   ```
+
+   Ignored units drop off the warning, but the line still counts them, e.g.
+   `no failed units (2 ignored)`. The installer creates this file once and never
+   overwrites it.
+
+smartmontools comes with `smartd`, a monitoring service that fails when there is no
+SMART-capable disk to watch, for example on a Pi that runs from an SD card. The
+dashboard only needs `smartctl`, so the installer disables `smartd` if it has failed
+and tells you how to turn it back on.
+
 ## How it works
 
 | File | Purpose |
@@ -109,6 +138,7 @@ btrfs, ZFS). The member disks of an mdadm array are still checked one by one.
 | `healthcheck.timer` | runs the check 30s after boot, then every 15 minutes |
 | `healthcheck-weekly.timer` | weekly `dpkg --verify` at idle priority; catches up after downtime |
 | `healthcheck-marker.service` | records clean/unclean shutdowns (power loss, crash) |
+| `/etc/healthcheck/ignore-units` | failed units to leave off the dashboard (yours to edit) |
 | `/var/lib/healthcheck/` | `alerts.log` (kernel errors and unclean shutdowns, kept across reboots), weekly result, boot marker |
 
 The status file lives in `/run`, which is cleared at every boot, so it only describes

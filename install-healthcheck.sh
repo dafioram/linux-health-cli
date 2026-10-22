@@ -6,7 +6,7 @@
 #   --no-apt           skip installing smartmontools
 #   --run-weekly-now   start the weekly dpkg verification in the background
 #   --uninstall        remove units and scripts (keeps saved alert history)
-#   --purge            with --uninstall, also delete /var/lib/healthcheck
+#   --purge            with --uninstall, also delete /var/lib/healthcheck and /etc/healthcheck
 #   -h, --help         show this help
 
 set -u
@@ -15,6 +15,7 @@ SBIN=/usr/local/sbin/healthcheck
 HOOK=/etc/profile.d/healthcheck.sh
 UNITDIR=/etc/systemd/system
 STATE=/var/lib/healthcheck
+IGNORE=/etc/healthcheck/ignore-units
 UNITS=(healthcheck.service healthcheck.timer healthcheck-weekly.service healthcheck-weekly.timer healthcheck-marker.service)
 ENABLE=(healthcheck-marker.service healthcheck.timer healthcheck-weekly.timer)
 
@@ -56,7 +57,8 @@ if [ "$UNINSTALL" = 1 ]; then
   for u in "${UNITS[@]}"; do rm -f "$UNITDIR/$u"; done
   rm -f "$SBIN" "$HOOK" /run/healthcheck.status
   systemctl daemon-reload >/dev/null 2>&1
-  if [ "$PURGE" = 1 ]; then rm -rf "$STATE"; info "removed $STATE"; else note "kept $STATE (use --purge to delete)"; fi
+  if [ "$PURGE" = 1 ]; then rm -rf "$STATE" "${IGNORE%/*}"; info "removed $STATE and ${IGNORE%/*}"
+  else note "kept $STATE and $IGNORE (use --purge to delete)"; fi
   info "uninstalled"
   exit 0
 fi
@@ -104,6 +106,16 @@ else
   note "skipping apt (--no-apt)"
 fi
 
+# smartd (installed and enabled with smartmontools) exits with an error when there's no
+# SMART-capable disk to monitor, e.g. a Pi on an SD card. We only use smartctl.
+for u in smartmontools.service smartd.service; do
+  if systemctl -q is-failed "$u" 2>/dev/null; then
+    systemctl disable --now "$u" >/dev/null 2>&1; systemctl reset-failed "$u" >/dev/null 2>&1
+    note "disabled $u: it failed (usually no SMART-capable disks to monitor); re-enable with: systemctl enable --now $u"
+    break
+  fi
+done
+
 # --- file writer: backup if changed, write atomically ---
 write_file() {  # usage: write_file PATH MODE  (content on stdin)
   local path=$1 mode=$2 tmp
@@ -131,6 +143,7 @@ STATE=/var/lib/healthcheck
 ALERTS=$STATE/alerts.log
 WEEKLY=$STATE/weekly.status
 OUT=/run/healthcheck.status
+IGNORE=/etc/healthcheck/ignore-units
 PAT='I/O error|EXT4-fs error|Remounting filesystem read-only|mmc[0-9]+: .*([Tt]imeout|CRC|error)|blk_update_request|[Uu]nder-?voltage|usb [0-9.-]+: (USB disconnect|device descriptor read|device not accepting address|unable to enumerate|Cannot enable)|nvme[0-9]+: .*(timeout|reset)|ata[0-9.]+: .*(exception|failed|error)|Out of memory|oom-kill|Call trace|Hardware Error|Machine check'
 mkdir -p "$STATE"
 
@@ -270,9 +283,29 @@ if [ -n "${tot:-}" ] && [ -n "${avail:-}" ]; then
   p=$((avail*100/tot))
   if [ "$p" -lt 10 ]; then add WARN memory "only ${p}% available"; else add OK memory "${p}% available"; fi
 fi
+ignored() {  # is unit $1 matched by a pattern in $IGNORE?
+  local p
+  [ -r "$IGNORE" ] || return 1
+  while read -r p _; do
+    case $p in ''|'#'*) continue ;; esac
+    # shellcheck disable=SC2254  # $p is a glob on purpose
+    case $1 in $p) return 0 ;; esac
+  done < "$IGNORE"
+  return 1
+}
 if have systemctl; then
-  failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | head -n 5 | tr '\n' ' ')
-  if [ -n "$failed" ]; then add WARN services "failed: $failed"; else add OK services "no failed units"; fi
+  failed=(); nign=0
+  while read -r u _; do
+    if ignored "$u"; then nign=$((nign+1)); else failed+=("$u"); fi
+  done < <(systemctl --failed --no-legend --plain 2>/dev/null)
+  ign=""; [ "$nign" -gt 0 ] && ign=" ($nign ignored)"
+  if [ ${#failed[@]} -gt 0 ]; then
+    more=""; [ ${#failed[@]} -gt 5 ] && more=" +$(( ${#failed[@]} - 5 )) more"
+    add WARN services "failed: ${failed[*]:0:5}$more$ign"
+    add DETAIL "" "why: systemctl status <unit>   hide: add it to $IGNORE"
+  else
+    add OK services "no failed units$ign"
+  fi
 fi
 
 # --- Weekly package verification result ---
@@ -300,6 +333,25 @@ HC_EOF
 
 if [ -f "$SBIN" ]; then
   if bash -n "$SBIN" 2>/dev/null; then info "syntax check passed for $SBIN"; else err "syntax check FAILED for $SBIN"; fi
+fi
+
+# ==================== ignore list (created once, yours to edit) ====================
+if [ -e "$IGNORE" ]; then
+  note "kept your $IGNORE"
+else
+  write_file "$IGNORE" 0644 <<'IGN_EOF'
+# Failed systemd units listed here are left off the dashboard's "services" line
+# (they are still counted as "N ignored"). One unit name or shell glob per line.
+#
+# Before hiding a unit, consider the system-level fixes:
+#   sudo systemctl reset-failed UNIT    clear a one-off failure (until it fails again)
+#   sudo systemctl mask UNIT            the unit is never needed on this machine
+#
+# Examples:
+#motd-news.service
+#nvmf-autoconnect.service
+#mnt-*.mount
+IGN_EOF
 fi
 
 # ==================== the login hook ====================
