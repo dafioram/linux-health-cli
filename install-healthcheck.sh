@@ -35,7 +35,7 @@ for a in "$@"; do
     --run-weekly-now) RUN_WEEKLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) die "unknown option: $a (try --help)" ;;
   esac
 done
@@ -66,7 +66,7 @@ fi
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
 
 missing=()
-for cmd in bash awk grep sed df stat mktemp date dmesg lsblk dpkg cmp; do
+for cmd in bash awk grep sed df stat mktemp date dmesg lsblk dpkg cmp timeout; do
   command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -185,9 +185,11 @@ fi
 errs=$(dmesg 2>/dev/null | grep -E "$PAT")
 n=$(grep -c . <<<"$errs")
 if [ "$n" -gt 0 ]; then
-  while IFS= read -r l; do
-    grep -qF "| $BOOT | $l" "$ALERTS" 2>/dev/null || alert "$BOOT | $l"
-  done < <(head -n 20 <<<"$errs")
+  new=0
+  while [ "$new" -lt 20 ] && IFS= read -r l; do
+    grep -qF "| $BOOT | $l" "$ALERTS" 2>/dev/null && continue
+    alert "$BOOT | $l"; new=$((new+1))
+  done <<<"$errs"
   add WARN kernel "$n error-like lines since boot, latest:"
   tail -n 3 <<<"$errs" | while IFS= read -r l; do add DETAIL "" "$l"; done
 else
@@ -226,7 +228,7 @@ usage_check() {  # $1=word for display ("space"|"inodes") $2=df field
     else
       add OK "$mp" "$free% free $1"
     fi
-  done < <(df -x tmpfs -x devtmpfs -x squashfs -x overlay --output="$2",target 2>/dev/null | tail -n +2)
+  done < <(df -l -x tmpfs -x devtmpfs -x squashfs -x overlay --output="$2",target 2>/dev/null | tail -n +2)
 }
 usage_check space pcent
 usage_check inodes ipcent
@@ -234,8 +236,8 @@ usage_check inodes ipcent
 # --- Drives ---
 smart_check() {
   local dev=/dev/$1 out bad wear used hrs msg lvl=OK
-  out=$(smartctl -H -A "$dev" 2>&1)
-  grep -qE 'overall-health|SMART Health Status' <<<"$out" || out=$(smartctl -d sat -H -A "$dev" 2>&1)
+  out=$(timeout 30 smartctl -H -A "$dev" 2>&1)
+  grep -qE 'overall-health|SMART Health Status' <<<"$out" || out=$(timeout 30 smartctl -d sat -H -A "$dev" 2>&1)
   if ! grep -qE 'overall-health|SMART Health Status' <<<"$out"; then
     add INFO "$1" "no SMART support (normal for USB flash drives)"; return
   fi
@@ -292,6 +294,7 @@ if [ -s "$ALERTS" ]; then
   fi
 fi
 
+add TS "$(cut -d. -f1 /proc/uptime)" ""   # uptime at write; age survives clock jumps (no RTC)
 chmod 644 "$TMP"; mv -f "$TMP" "$OUT"
 HC_EOF
 
@@ -306,8 +309,11 @@ case $- in *i*) ;; *) return 0 ;; esac      # interactive only (scp/rsync/ssh cm
 [ -n "${HEALTH_SHOWN:-}" ] && return 0       # once per login, not per nested shell
 export HEALTH_SHOWN=1
 _hc=/run/healthcheck.status
+_up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
 if [ -r "$_hc" ]; then
-  _age=$(( ($(date +%s) - $(stat -c %Y "$_hc")) / 60 ))
+  _ts=$(sed -n 's/^TS|\([0-9]*\)|.*/\1/p' "$_hc")
+  if [ -n "$_ts" ] && [ -n "$_up" ]; then _age=$(( (_up - _ts) / 60 ))
+  else _age=$(( ($(date +%s) - $(stat -c %Y "$_hc")) / 60 )); fi
   printf '\033[1;33m--- System health (checked %s min ago) ---\033[0m\n' "$_age"
   [ "$_age" -gt 40 ] && printf '\033[1;31m ⚠ status is stale, is healthcheck.timer running?\033[0m\n'
   while IFS='|' read -r _l _n _m; do
@@ -320,8 +326,16 @@ if [ -r "$_hc" ]; then
     esac
   done < "$_hc"
   echo
+else                                         # /run is wiped at boot; say so instead of printing nothing
+  printf '\033[1;33m--- System health: no results yet this boot ---\033[0m\n'
+  if [ "${_up:-0}" -lt 300 ]; then
+    printf ' first check runs about 30s after boot; log in again in a minute\n'
+  else
+    printf '\033[1;31m ⚠ check: systemctl status healthcheck.timer healthcheck.service\033[0m\n'
+  fi
+  echo
 fi
-unset _hc _age _l _n _m
+unset _hc _age _up _ts _l _n _m
 HOOK_EOF
 
 # ==================== systemd units ====================
@@ -333,6 +347,8 @@ Description=System health check (writes /run/healthcheck.status)
 Type=oneshot
 ExecStart=/usr/local/sbin/healthcheck run
 Nice=10
+# oneshot units never time out by default; a hung run would stop the timer re-firing for good
+TimeoutStartSec=10min
 U_EOF
 
 write_file "$UNITDIR/healthcheck.timer" 0644 <<'U_EOF'
@@ -340,8 +356,9 @@ write_file "$UNITDIR/healthcheck.timer" 0644 <<'U_EOF'
 Description=Run system health check every 15 minutes
 
 [Timer]
-OnBootSec=2min
+OnBootSec=30s
 OnUnitActiveSec=15min
+AccuracySec=10s
 
 [Install]
 WantedBy=timers.target
@@ -397,7 +414,8 @@ for u in "${UNITS[@]}"; do
 done
 
 if command -v systemd-analyze >/dev/null 2>&1; then
-  vout=$(systemd-analyze verify "${UNITS[@]/#/$UNITDIR/}" 2>&1)
+  # verify also loads every unit ours depend on; only report notes about our own units
+  vout=$(systemd-analyze verify "${UNITS[@]/#/$UNITDIR/}" 2>&1 | grep healthcheck)
   [ -n "$vout" ] && warn "systemd-analyze verify notes:"$'\n'"$vout"
 fi
 
