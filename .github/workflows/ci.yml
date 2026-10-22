@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get install -y --no-install-recommends shellcheck dash
+      - run: tests/lint.sh
+
+  # real install on a systemd host (the runner VM): units, status file, login hook, uninstall
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            args: --no-apt
+          - os: ubuntu-24.04
+            args: ""          # also exercises the smartmontools apt install
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo tests/install-test.sh ${{ matrix.args }}
+
+  # install into a systemd container, reboot it, and check the dashboard comes back
+  reboot:
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [debian:bookworm, debian:trixie]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: tests/reboot-test.sh ${{ matrix.base }}
