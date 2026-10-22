@@ -80,6 +80,64 @@ check "ack clears alerts" test ! -s "$STATE/alerts.log"
 check "ack keeps a copy" grep -q 'unclean shutdown' "$STATE/alerts.acked.log"
 echo running > "$STATE/boot_state"
 
+section "journal scan after an unclean shutdown"
+FAKEBIN=$(mktemp -d)
+cat > "$FAKEBIN/journalctl" <<'EOF'
+#!/bin/sh
+# fake journalctl: prints $FAKE_JOURNAL for boot $FAKE_BOOT, else fails like the real one
+case " $* " in *" -b $FAKE_BOOT "*) [ -n "$FAKE_JOURNAL" ] && printf '%s\n' "$FAKE_JOURNAL" && exit 0 ;; esac
+echo "No journal boot entry found for the specified boot" >&2; exit 1
+EOF
+chmod +x "$FAKEBIN/journalctl"
+crash_boot() {  # pretend boot $1 just ended in a power cut, then boot
+  echo "$1" > "$STATE/last_boot_id"; echo running > "$STATE/boot_state"; /usr/local/sbin/healthcheck boot
+}
+journal_run() { FAKE_BOOT=$prev FAKE_JOURNAL=$1 PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run; }
+prev=0123456789abcdef0123456789abcdef
+A=$STATE/alerts.log
+
+: > "$A"
+crash_boot "$prev"
+check "unclean shutdown queues a scan of that boot" grep -qx "$prev" "$STATE/scan_boot"
+check "this boot's id is remembered" test "$(cat "$STATE/last_boot_id")" = "$(tr -d - < /proc/sys/kernel/random/boot_id)"
+echo "2026-01-01 00:00:00 | ${prev:0:8} | [   10.000000] EXT4-fs error (device sda1): saved while running" >> "$A"
+journal_run "EXT4-fs error (device sda1): saved while running
+systemd-journald: some harmless line
+blk_update_request: I/O error, dev sda, sector 42"
+check "error after the last run is recovered" grep -qF "| ${prev:0:8} | journal: blk_update_request: I/O error, dev sda, sector 42" "$A"
+check "error saved while running isn't duplicated" test "$(grep -c 'saved while running' "$A")" = 1
+check "non-matching lines are ignored" bash -c "! grep -q harmless '$A'"
+check "scan only runs once" test ! -e "$STATE/scan_boot"
+check "recovered error shows in history" grep -q 'journal: blk_update_request' "$STATUS"
+
+: > "$A"
+crash_boot "$prev"
+journal_run ""; rc=$?     # DietPi: journal kept in RAM, nothing saved for the crashed boot
+check "no saved journal: run still succeeds" test "$rc" = 0
+check "no saved journal: status still written" test -s "$STATUS"
+check "no saved journal: only the unclean-shutdown alert" test "$(grep -c . "$A")" = 1
+check "no saved journal: scan cleared" test ! -e "$STATE/scan_boot"
+
+echo running > "$STATE/boot_state"; echo clean > "$STATE/boot_state"
+: > "$A"
+/usr/local/sbin/healthcheck boot
+check "clean shutdown queues no scan" test ! -e "$STATE/scan_boot"
+rm -rf "$FAKEBIN"
+
+# the real journalctl: a kernel error that is in the journal but no longer in dmesg
+cur=$(tr -d - < /proc/sys/kernel/random/boot_id)
+msg="hc-test-$$: I/O error, dev hctest"
+echo "<3>$msg" > /dev/kmsg; sleep 1
+if journalctl -q --no-pager -k -b "$cur" -o cat 2>/dev/null | grep -qF "$msg"; then
+  dmesg -C
+  : > "$A"; echo "$cur" > "$STATE/scan_boot"
+  /usr/local/sbin/healthcheck run
+  check "real journalctl: error recovered" grep -qF "journal: $msg" "$A"
+else
+  echo "  skip real journalctl check (this system's journal doesn't record kernel messages)"
+fi
+: > "$A"; echo running > "$STATE/boot_state"
+
 section "failed services and the ignore list"
 check "ignore list created" test -f "$IGNORE"
 printf '[Service]\nType=oneshot\nExecStart=/bin/false\n' > /etc/systemd/system/hc-test-fail.service

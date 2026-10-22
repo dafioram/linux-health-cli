@@ -151,7 +151,12 @@ alert() { echo "$(date '+%F %T') | $1" >> "$ALERTS"; }
 
 case "${1:-run}" in
   boot)      # unclean shutdown detection (Pi has no RTC, so early timestamps may be off)
-    [ "$(cat "$STATE/boot_state" 2>/dev/null)" = running ] && alert "unclean shutdown before this boot (power loss or crash?)"
+    last=$(cat "$STATE/last_boot_id" 2>/dev/null)
+    tr -d - < /proc/sys/kernel/random/boot_id > "$STATE/last_boot_id"
+    if [ "$(cat "$STATE/boot_state" 2>/dev/null)" = running ]; then
+      alert "unclean shutdown before this boot (power loss or crash?)"
+      [ -n "$last" ] && echo "$last" > "$STATE/scan_boot"   # next run looks in the journal for that boot
+    fi
     echo running > "$STATE/boot_state"; exit 0 ;;
   shutdown)  echo clean > "$STATE/boot_state"; exit 0 ;;
   weekly)
@@ -315,6 +320,19 @@ if [ -f "$WEEKLY" ]; then
   else add WARN weekly "$wc package files differ ($wd):"; sed -n '3,5p' "$WEEKLY" | while IFS= read -r l; do add DETAIL "" "$l"; done; fi
 else
   add INFO weekly "weekly package check hasn't run yet"
+fi
+
+# --- After an unclean shutdown: kernel errors the crashed boot logged after our last run ---
+# Only possible with a persistent journal; with none (DietPi keeps it in RAM) this finds nothing.
+if [ -s "$STATE/scan_boot" ]; then
+  id=$(cat "$STATE/scan_boot"); rm -f "$STATE/scan_boot"
+  if have journalctl && [[ $id =~ ^[0-9a-f]{32}$ ]]; then
+    # already saved during that boot (or acked) -> skip; compare message text without the [uptime] stamp
+    known=$(cat "$ALERTS" "$STATE/alerts.acked.log" 2>/dev/null | grep -F "| ${id:0:8} | " | sed -E 's/^[^|]*\| [^|]*\| //; s/^journal: //; s/^\[ *[0-9.]+\] //')
+    while IFS= read -r l; do
+      grep -qxF -- "$l" <<<"$known" || alert "${id:0:8} | journal: $l"
+    done < <(timeout 60 journalctl -q --no-pager -k -b "$id" -o cat 2>/dev/null | grep -E "$PAT" | tail -n 20)
+  fi
 fi
 
 # --- Past events that are no longer in dmesg ---
