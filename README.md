@@ -51,7 +51,7 @@ to `alerts.acked.log`.
 |---|---|---|
 | `power` | `vcgencmd get_throttled` (Raspberry Pi only) | ✗ undervoltage/throttling now, ⚠ it happened since boot |
 | `temp` | hottest `/sys/class/thermal` zone | ⚠ ≥70 °C, ✗ ≥80 °C |
-| `kernel` | `dmesg` this boot: I/O errors, ext4 errors, read-only remounts, SD/eMMC timeouts and CRC errors, NVMe resets, ATA errors, USB disconnects, undervoltage, OOM kills, call traces, machine checks | ⚠ any match (shows the latest 3) |
+| `kernel` | `dmesg` this boot, plus the journal after a crash ([see below](#how-it-works)): I/O errors, ext4 errors, read-only remounts, SD/eMMC timeouts and CRC errors, NVMe resets, ATA errors, USB disconnects, undervoltage, OOM kills, call traces, machine checks | ⚠ any match (shows the latest 3) |
 | `mounts` | `/proc/mounts` for ext2/3/4, btrfs, xfs, f2fs, vfat, exfat, ntfs3 | ✗ any of them mounted read-only |
 | `ext4` | `/sys/fs/ext4/*/errors_count` | ⚠ any count above zero (stays until `fsck` clears it) |
 | one per mount | `df`: space, then inodes | ⚠ 10% or less free |
@@ -144,6 +144,15 @@ and tells you how to turn it back on.
 The status file lives in `/run`, which is cleared at every boot, so it only describes
 the current boot. Kernel errors are also copied to `alerts.log`, deduplicated, at most
 20 new lines per run, so they still show up after the kernel log is gone.
+
+The kernel log (`dmesg`) only covers the current boot, so after a power cut or crash,
+anything logged between the last 15-minute check and the crash would be lost. Those
+are often the messages that explain it. If `journalctl` is installed and the journal
+is kept on disk, the first check after an unclean shutdown also reads the crashed
+boot's kernel messages from the journal. It saves up to 20 matching errors that
+weren't already saved, marked `journal:` in the history. Without a saved journal
+(DietPi keeps it in RAM by default) or without `journalctl`, this step finds nothing
+and changes nothing.
 
 ## Troubleshooting
 
