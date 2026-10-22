@@ -42,8 +42,13 @@ section "boot $IMAGE"
 docker run -d --name "$NAME" --privileged --tmpfs /run --tmpfs /run/lock \
   -v "$ROOT:/src:ro" "$IMAGE" >/dev/null || { echo "container failed to start"; exit 2; }
 check "systemd is up" booted
+# a smartd that fails like it does on a box with no SMART-capable disks (Pi on an SD card)
+dx bash -c 'printf "[Service]\nExecStart=/bin/sh -c \"exit 17\"\n[Install]\nWantedBy=multi-user.target\n" > /etc/systemd/system/smartmontools.service
+  systemctl daemon-reload; systemctl enable -q smartmontools.service; systemctl start smartmontools.service' 2>/dev/null
 dx bash /src/install-healthcheck.sh --no-apt > /dev/null 2>&1
 check "installer exits 0" test $? = 0
+check "failing smartd was disabled" bash -c "! docker exec '$NAME' systemctl -q is-enabled smartmontools.service"
+check "and no longer shows as failed" bash -c "! docker exec '$NAME' systemctl -q is-failed smartmontools.service"
 check "status written at install" dx test -s "$STATUS"
 
 section "clean reboot"
