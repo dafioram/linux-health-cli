@@ -158,6 +158,59 @@ else
 fi
 : > "$A"; echo running > "$STATE/boot_state"
 
+section "SMART counters (fake smartctl)"
+FAKEBIN=$(mktemp -d)
+printf '#!/bin/sh\ncat "$FAKE_SMART"\n' > "$FAKEBIN/smartctl"; chmod +x "$FAKEBIN/smartctl"
+FAKE_SMART=$(mktemp)
+smart() {  # usage: smart REPORTED_UNCORRECT_RAW [PENDING_RAW] [REALLOCATED_RAW]: fake smartctl -i -H -A output
+  cat > "$FAKE_SMART" <<EOF
+Serial Number:    HCTEST123
+SMART overall-health self-assessment test result: PASSED
+ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  5 Reallocated_Sector_Ct   0x0033   100   100   005    Pre-fail  Always       -       ${3:-0}
+  9 Power_On_Hours          0x0012   089   089   000    Old_age   Always       -       5157
+187 Reported_Uncorrect      0x0032   100   098   000    Old_age   Always       -       $1
+188 Command_Timeout         0x0032   100   100   000    Old_age   Always       -       68722556928
+197 Current_Pending_Sector  0x0022   100   100   000    Old_age   Always       -       ${2:-0}
+198 Offline_Uncorrectable   0x0008   100   100   000    Old_age   Offline      -       0
+EOF
+}
+disk_line() {  # run (or ack, with $1=ack) with the fake smartctl; print the first disk's line
+  FAKE_SMART=$FAKE_SMART PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck "${1:-run}"
+  grep -m1 '|SMART passed' "$STATUS"
+}
+rm -rf "$STATE/smart-acked"
+if lsblk -dnro TYPE | grep -qx disk; then
+  smart 524291                 # the HGST drive: 0x80003, really 3
+  l=$(disk_line); echo "    $l"
+  check "packed raw 524291 reads as 3 uncorrectable read errors" grep -qE '^WARN\|[^|]+\|SMART passed, 5157h on, 3 uncorrectable read error\(s\)$' <<<"$l"
+  check "with how to accept them" grep -q 'accept them with: sudo healthcheck ack' "$STATUS"
+  l=$(disk_line ack); echo "    $l"
+  check "after ack: OK, shown as old" grep -qE '^OK\|[^|]+\|SMART passed, 5157h on, 3 old uncorrectable read error\(s\) \(acked\)$' <<<"$l"
+  check "ack is remembered per drive serial" test -s "$STATE/smart-acked/HCTEST123"
+  l=$(disk_line); echo "    $l"
+  check "still OK on the next run" grep -q '^OK|' <<<"$l"
+  smart 524293                 # 0x80005: two more
+  l=$(disk_line); echo "    $l"
+  check "an increase warns again, with how many are new" grep -qE '^WARN\|[^|]+\|.*5 uncorrectable read error\(s\) \(2 new\)$' <<<"$l"
+  smart 524293 8
+  disk_line ack >/dev/null; l=$(grep -m1 '|SMART passed' "$STATUS"); echo "    $l"
+  check "pending sectors warn even after ack" grep -qE '^WARN\|[^|]+\|.*5 old uncorrectable read error\(s\) \(acked\), 8 pending \(unreadable\) sector\(s\)$' <<<"$l"
+  rm -rf "$STATE/smart-acked"
+  smart 12 0 7                 # a plain count, as most drives report it
+  l=$(disk_line); echo "    $l"
+  check "plain counts are shown as-is" grep -qE '\|SMART passed, 5157h on, 7 reallocated sector\(s\), 12 uncorrectable read error\(s\)$' <<<"$l"
+  smart 65536                  # low 16 bits are 0: can't decode, so don't hide it
+  l=$(disk_line); echo "    $l"
+  check "undecodable large value is shown raw, not hidden" grep -q '65536 uncorrectable read error' <<<"$l"
+  smart 0
+  l=$(disk_line); echo "    $l"
+  check "clean drive: OK" grep -qE '^OK\|[^|]+\|SMART passed, 5157h on$' <<<"$l"
+else
+  echo "  skip SMART counter checks (no disks listed by lsblk)"
+fi
+rm -rf "$FAKEBIN" "$FAKE_SMART" "$STATE/smart-acked"
+
 section "ZFS pools (fake zpool)"
 FAKEBIN=$(mktemp -d)
 cat > "$FAKEBIN/zpool" <<'EOF'

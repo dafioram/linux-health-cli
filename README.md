@@ -43,7 +43,8 @@ changed ones are backed up as `*.bak.<timestamp>` first.
 | `--uninstall --purge` | also delete `/var/lib/healthcheck` and `/etc/healthcheck` |
 
 Clear saved alerts once you've read them with `sudo healthcheck ack`. They are moved
-to `alerts.acked.log`.
+to `alerts.acked.log`. The same command accepts each drive's current lifetime error
+counts (see [Bad sectors and read errors](#bad-sectors-and-read-errors)).
 
 ## What it checks
 
@@ -82,7 +83,7 @@ enclosures need:
 
 | Drive | Typical line | Warns when |
 |---|---|---|
-| SATA hard disk | `SMART passed, 41234h on` | ⚠ any of Reallocated, Current Pending, Offline Uncorrectable or Reported Uncorrect sectors above zero |
+| SATA hard disk | `SMART passed, 41234h on` | ⚠ [bad sectors or read errors](#bad-sectors-and-read-errors) |
 | SATA SSD | `SMART passed, 9120h on, ~93% life left` | ⚠ under 20% life left. Life left is the normalized value of the first of Wear_Leveling_Count, Media_Wearout_Indicator, Percent_Lifetime_Remain, SSD_Life_Left, Remaining_Lifetime_Perc. Bad sectors warn as for hard disks. |
 | NVMe SSD | `SMART passed, 3% life used` | ⚠ 80% or more of rated life used |
 | SAS/SCSI disk | `SMART passed` | health status only |
@@ -90,6 +91,27 @@ enclosures need:
 | Any drive failing its SMART self-assessment | `SMART health FAILED - back up now` | ✗ always |
 | USB flash drive, VM disk, unsupported USB bridge | `no SMART support (normal for USB flash drives)` | info only |
 | SD card / eMMC (`mmcblk*`) | `SD/eMMC has no SMART; judged by kernel, ext4 and mount checks` | info only |
+
+#### Bad sectors and read errors
+
+| Attribute | Shown as | Warns |
+|---|---|---|
+| 5 Reallocated_Sector_Ct | `24 reallocated sector(s)` | until acknowledged, then only when it grows: `26 reallocated sector(s) (2 new)` |
+| 187 Reported_Uncorrect | `3 uncorrectable read error(s)` | the same |
+| 197 Current_Pending_Sector | `8 pending (unreadable) sector(s)` | always |
+| 198 Offline_Uncorrectable | `2 offline-uncorrectable sector(s)` | always |
+
+Reallocated sectors and uncorrectable reads are lifetime counts that never go down,
+so an old event would otherwise warn forever. Once you've checked the drive (a long
+self-test, a ZFS scrub), `sudo healthcheck ack` records the current counts, and the
+line becomes `3 old uncorrectable read error(s) (acked)` until the count grows.
+Counts are kept per drive serial number. Pending and offline-uncorrectable sectors
+are sectors the drive can't read right now, so they always warn.
+
+Some firmware, for example HGST's, packs extra fields above the low 16 bits of these
+raw values. `smartctl` might show `Reported_Uncorrect` as `524291` (hex `0x80003`)
+for a drive whose error log holds 3 errors. Values above 65535 are therefore read
+from their low 16 bits. If those are all zero, the raw value is shown as-is.
 
 `zram`, `ram`, `loop` and the eMMC `boot` partitions are skipped. Without
 smartmontools each disk shows `smartctl missing`.

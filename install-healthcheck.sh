@@ -164,7 +164,8 @@ case "${1:-run}" in
     res=$(nice -n 19 dpkg --verify 2>&1 | grep -v ' c /' | grep -vE '/var/lib/(apt/(mirrors(/partial)?|periodic)|rpimonitor/updatestatus\.txt)$')   # ignore modified config files and known DietPi/rpimonitor noise
     { date '+%F'; grep -c . <<<"$res"; [ -n "$res" ] && head -n 10 <<<"$res"; } > "$WEEKLY"
     exit 0 ;;
-  ack)       [ -s "$ALERTS" ] && { cat "$ALERTS" >> "$STATE/alerts.acked.log"; : > "$ALERTS"; } ;;
+  ack)       [ -s "$ALERTS" ] && { cat "$ALERTS" >> "$STATE/alerts.acked.log"; : > "$ALERTS"; }
+             ACKING=1 ;;   # the run below also accepts drives' current lifetime SMART counts
   run)       ;;
   *)         echo "usage: $0 [run|weekly|ack]"; exit 1 ;;
 esac
@@ -253,17 +254,25 @@ usage_check space pcent
 usage_check inodes ipcent
 
 # --- Drives ---
+attr_of() { awk -v a="$1" '$1==a {print $2; exit}' <<<"$2"; }   # value of attribute $1 in "name value" lines $2
 smart_check() {
-  local dev=/dev/$1 out bad wear used hrs msg lvl=OK
-  out=$(timeout 30 smartctl -H -A "$dev" 2>&1)
-  grep -qE 'overall-health|SMART Health Status' <<<"$out" || out=$(timeout 30 smartctl -d sat -H -A "$dev" 2>&1)
+  local dev=/dev/$1 out wear used hrs msg lvl=OK key vals acked spec a what n n0 unacked=0
+  out=$(timeout 30 smartctl -i -H -A "$dev" 2>&1)
+  grep -qE 'overall-health|SMART Health Status' <<<"$out" || out=$(timeout 30 smartctl -d sat -i -H -A "$dev" 2>&1)
   if ! grep -qE 'overall-health|SMART Health Status' <<<"$out"; then
     add INFO "$1" "no SMART support (normal for USB flash drives)"; return
   fi
   if grep -qE 'overall-health.*FAILED|Health Status: (FAILED|FAILING)' <<<"$out"; then
     add CRIT "$1" "SMART health FAILED - back up now"; return
   fi
-  bad=$(awk '$2 ~ /^(Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable|Reported_Uncorrect)$/ && $10+0>0 {printf "%s=%s ",$2,$10}' <<<"$out")
+  # sector/error counters as "name value"; some firmware (e.g. HGST) packs extra fields above the
+  # low 16 bits of the raw value, so 524291 (0x80003) means 3. If the low bits are 0, keep the raw.
+  vals=$(awk '$2 ~ /^(Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable|Reported_Uncorrect)$/ {
+    n = $10 + 0; if (n > 65535 && n % 65536 > 0) n = n % 65536; print $2, n }' <<<"$out")
+  key=$(awk -F: '/^Serial [Nn]umber:/ {gsub(/[^A-Za-z0-9._-]/, "", $2); print $2; exit}' <<<"$out")
+  key=$STATE/smart-acked/${key:-$1}
+  if [ "${ACKING:-0}" = 1 ]; then mkdir -p "${key%/*}" && printf '%s\n' "$vals" > "$key"; fi
+  acked=$(cat "$key" 2>/dev/null)
   wear=$(awk '$2 ~ /^(Wear_Leveling_Count|Media_Wearout_Indicator|Percent_Lifetime_Remain|SSD_Life_Left|Remaining_Lifetime_Perc)$/ {print $4+0; exit}' <<<"$out")
   used=$(awk -F: '/Percentage Used/ {gsub(/[ %]/,"",$2); print $2}' <<<"$out")
   hrs=$(awk '$2=="Power_On_Hours" {print $10+0; exit}' <<<"$out")
@@ -271,8 +280,26 @@ smart_check() {
   [ -n "$hrs" ]  && msg="$msg, ${hrs}h on"
   [ -n "$wear" ] && { msg="$msg, ~${wear}% life left"; [ "$wear" -lt 20 ] && lvl=WARN; }
   [ -n "$used" ] && { msg="$msg, ${used}% life used"; [ "$used" -ge 80 ] && lvl=WARN; }
-  [ -n "$bad" ]  && { msg="$msg, BAD SECTORS: $bad"; lvl=WARN; }
+  # lifetime counts never go down: warn until acked, then only when they grow
+  for spec in "Reallocated_Sector_Ct|reallocated sector(s)" "Reported_Uncorrect|uncorrectable read error(s)"; do
+    a=${spec%%|*}; what=${spec#*|}
+    n=$(attr_of "$a" "$vals"); [ "${n:-0}" -gt 0 ] || continue
+    n0=$(attr_of "$a" "$acked"); n0=${n0:-0}
+    if [ "$n" -gt "$n0" ]; then
+      msg="$msg, $n $what"; [ "$n0" -gt 0 ] && msg="$msg ($((n - n0)) new)"
+      lvl=WARN; unacked=1
+    else
+      msg="$msg, $n old $what (acked)"
+    fi
+  done
+  # sectors the drive can't read right now: always a warning
+  for spec in "Current_Pending_Sector|pending (unreadable) sector(s)" "Offline_Uncorrectable|offline-uncorrectable sector(s)"; do
+    a=${spec%%|*}; what=${spec#*|}
+    n=$(attr_of "$a" "$vals"); [ "${n:-0}" -gt 0 ] && { msg="$msg, $n $what"; lvl=WARN; }
+  done
   add "$lvl" "$1" "$msg"
+  [ "$unacked" = 1 ] && add DETAIL "" "lifetime counts never go down; once checked, accept them with: sudo healthcheck ack"
+  return 0
 }
 for d in $(lsblk -dnro NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
   case $d in
