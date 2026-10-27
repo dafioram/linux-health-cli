@@ -145,6 +145,7 @@ WEEKLY=$STATE/weekly.status
 OUT=/run/healthcheck.status
 IGNORE=/etc/healthcheck/ignore-units
 PAT='I/O error|EXT4-fs error|Remounting filesystem read-only|mmc[0-9]+: .*([Tt]imeout|CRC|error)|blk_update_request|[Uu]nder-?voltage|usb [0-9.-]+: (USB disconnect|device descriptor read|device not accepting address|unable to enumerate|Cannot enable)|nvme[0-9]+: .*(timeout|reset)|ata[0-9.]+: .*(exception|failed|error)|Out of memory|oom-kill|Call trace|Hardware Error|Machine check'
+NOISE='nvme[0-9]+: Shutdown timeout set to'   # informational lines that match PAT
 mkdir -p "$STATE"
 
 alert() { echo "$(date '+%F %T') | $1" >> "$ALERTS"; }
@@ -200,7 +201,7 @@ if [ "$t" -gt 0 ]; then
 fi
 
 # --- Kernel errors this boot (also saved persistently, deduped, max 20 new per run) ---
-errs=$(dmesg 2>/dev/null | grep -E "$PAT")
+errs=$(dmesg 2>/dev/null | grep -E "$PAT" | grep -vE "$NOISE")
 n=$(grep -c . <<<"$errs")
 if [ "$n" -gt 0 ]; then
   new=0
@@ -331,7 +332,7 @@ if [ -s "$STATE/scan_boot" ]; then
     known=$(cat "$ALERTS" "$STATE/alerts.acked.log" 2>/dev/null | grep -F "| ${id:0:8} | " | sed -E 's/^[^|]*\| [^|]*\| //; s/^journal: //; s/^\[ *[0-9.]+\] //')
     while IFS= read -r l; do
       grep -qxF -- "$l" <<<"$known" || alert "${id:0:8} | journal: $l"
-    done < <(timeout 60 journalctl -q --no-pager -k -b "$id" -o cat 2>/dev/null | grep -E "$PAT" | tail -n 20)
+    done < <(timeout 60 journalctl -q --no-pager -k -b "$id" -o cat 2>/dev/null | grep -E "$PAT" | grep -vE "$NOISE" | tail -n 20)
   fi
 fi
 

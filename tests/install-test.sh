@@ -103,10 +103,12 @@ check "this boot's id is remembered" test "$(cat "$STATE/last_boot_id")" = "$(tr
 echo "2026-01-01 00:00:00 | ${prev:0:8} | [   10.000000] EXT4-fs error (device sda1): saved while running" >> "$A"
 journal_run "EXT4-fs error (device sda1): saved while running
 systemd-journald: some harmless line
+nvme nvme0: Shutdown timeout set to 8 seconds
 blk_update_request: I/O error, dev sda, sector 42"
 check "error after the last run is recovered" grep -qF "| ${prev:0:8} | journal: blk_update_request: I/O error, dev sda, sector 42" "$A"
 check "error saved while running isn't duplicated" test "$(grep -c 'saved while running' "$A")" = 1
 check "non-matching lines are ignored" bash -c "! grep -q harmless '$A'"
+check "informational NVMe timeout notice is ignored" bash -c "! grep -q 'Shutdown timeout set' '$A'"
 check "scan only runs once" test ! -e "$STATE/scan_boot"
 check "recovered error shows in history" grep -q 'journal: blk_update_request' "$STATUS"
 
