@@ -103,10 +103,12 @@ check "this boot's id is remembered" test "$(cat "$STATE/last_boot_id")" = "$(tr
 echo "2026-01-01 00:00:00 | ${prev:0:8} | [   10.000000] EXT4-fs error (device sda1): saved while running" >> "$A"
 journal_run "EXT4-fs error (device sda1): saved while running
 systemd-journald: some harmless line
+nvme nvme0: Shutdown timeout set to 8 seconds
 blk_update_request: I/O error, dev sda, sector 42"
 check "error after the last run is recovered" grep -qF "| ${prev:0:8} | journal: blk_update_request: I/O error, dev sda, sector 42" "$A"
 check "error saved while running isn't duplicated" test "$(grep -c 'saved while running' "$A")" = 1
 check "non-matching lines are ignored" bash -c "! grep -q harmless '$A'"
+check "informational NVMe timeout notice is ignored" bash -c "! grep -q 'Shutdown timeout set' '$A'"
 check "scan only runs once" test ! -e "$STATE/scan_boot"
 check "recovered error shows in history" grep -q 'journal: blk_update_request' "$STATUS"
 
@@ -155,6 +157,265 @@ else
   echo "  skip real kernel error checks (no device-mapper here)"
 fi
 : > "$A"; echo running > "$STATE/boot_state"
+
+section "SMART counters (fake smartctl)"
+FAKEBIN=$(mktemp -d)
+printf '#!/bin/sh\ncat "$FAKE_SMART"\n' > "$FAKEBIN/smartctl"; chmod +x "$FAKEBIN/smartctl"
+FAKE_SMART=$(mktemp)
+smart() {  # usage: smart REPORTED_UNCORRECT_RAW [PENDING_RAW] [REALLOCATED_RAW]: fake smartctl -i -H -A output
+  cat > "$FAKE_SMART" <<EOF
+Serial Number:    HCTEST123
+SMART overall-health self-assessment test result: PASSED
+ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  5 Reallocated_Sector_Ct   0x0033   100   100   005    Pre-fail  Always       -       ${3:-0}
+  9 Power_On_Hours          0x0012   089   089   000    Old_age   Always       -       5157
+187 Reported_Uncorrect      0x0032   100   098   000    Old_age   Always       -       $1
+188 Command_Timeout         0x0032   100   100   000    Old_age   Always       -       68722556928
+197 Current_Pending_Sector  0x0022   100   100   000    Old_age   Always       -       ${2:-0}
+198 Offline_Uncorrectable   0x0008   100   100   000    Old_age   Offline      -       0
+EOF
+}
+disk_line() {  # run (or ack, with $1=ack) with the fake smartctl; print the first disk's line
+  FAKE_SMART=$FAKE_SMART PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck "${1:-run}"
+  grep -m1 '|SMART passed' "$STATUS"
+}
+rm -rf "$STATE/smart-acked"
+if lsblk -dnro TYPE | grep -qx disk; then
+  smart 524291                 # the HGST drive: 0x80003, really 3
+  l=$(disk_line); echo "    $l"
+  check "packed raw 524291 reads as 3 uncorrectable read errors" grep -qE '^WARN\|[^|]+\|SMART passed, 5157h on, 3 uncorrectable read error\(s\)$' <<<"$l"
+  check "with how to accept them" grep -q 'accept them with: sudo healthcheck ack' "$STATUS"
+  l=$(disk_line ack); echo "    $l"
+  check "after ack: OK, shown as old" grep -qE '^OK\|[^|]+\|SMART passed, 5157h on, 3 old uncorrectable read error\(s\) \(acked\)$' <<<"$l"
+  check "ack is remembered per drive serial" test -s "$STATE/smart-acked/HCTEST123"
+  l=$(disk_line); echo "    $l"
+  check "still OK on the next run" grep -q '^OK|' <<<"$l"
+  smart 524293                 # 0x80005: two more
+  l=$(disk_line); echo "    $l"
+  check "an increase warns again, with how many are new" grep -qE '^WARN\|[^|]+\|.*5 uncorrectable read error\(s\) \(2 new\)$' <<<"$l"
+  smart 524293 8
+  disk_line ack >/dev/null; l=$(grep -m1 '|SMART passed' "$STATUS"); echo "    $l"
+  check "pending sectors warn even after ack" grep -qE '^WARN\|[^|]+\|.*5 old uncorrectable read error\(s\) \(acked\), 8 pending \(unreadable\) sector\(s\)$' <<<"$l"
+  rm -rf "$STATE/smart-acked"
+  smart 12 0 7                 # a plain count, as most drives report it
+  l=$(disk_line); echo "    $l"
+  check "plain counts are shown as-is" grep -qE '\|SMART passed, 5157h on, 7 reallocated sector\(s\), 12 uncorrectable read error\(s\)$' <<<"$l"
+  smart 65536                  # low 16 bits are 0: can't decode, so don't hide it
+  l=$(disk_line); echo "    $l"
+  check "undecodable large value is shown raw, not hidden" grep -q '65536 uncorrectable read error' <<<"$l"
+  smart 0
+  l=$(disk_line); echo "    $l"
+  check "clean drive: OK" grep -qE '^OK\|[^|]+\|SMART passed, 5157h on$' <<<"$l"
+else
+  echo "  skip SMART counter checks (no disks listed by lsblk)"
+fi
+rm -rf "$FAKEBIN" "$FAKE_SMART" "$STATE/smart-acked"
+
+section "ZFS pools (fake zpool)"
+FAKEBIN=$(mktemp -d)
+cat > "$FAKEBIN/zpool" <<'EOF'
+#!/bin/bash
+# fake zpool: one pool "tank" in state $FAKE_HEALTH, $FAKE_CAP full, last scan line $FAKE_SCAN
+case "${FAKE_MODE:-}" in   # machines where ZFS isn't really in use
+  nomodule) echo "The ZFS modules are not loaded." >&2; exit 1 ;;
+  nopools)  exit 0 ;;
+  chatty)   echo "no pools available"; exit 0 ;;
+esac
+case "$1 $2" in
+  "list -H") printf 'tank\t%s\t%s\n' "$FAKE_HEALTH" "${FAKE_CAP:-40%}" ;;
+  "status -x") if [ "$FAKE_HEALTH" = ONLINE ] && [ -z "${FAKE_ERRORS:-}" ]; then echo "pool 'tank' is healthy"
+               elif [ -n "${FAKE_ERRORS:-}" ]; then   # wrapped like the real thing
+                 printf '  pool: tank\n state: %s\nstatus: %s\n\tattempt was made to correct the error.\n action: ...\n' "$FAKE_HEALTH" "$FAKE_ERRORS"
+               else
+                 printf '  pool: tank\n state: %s\nstatus: One or more devices could not be used because the label is missing or\n\tinvalid.  Sufficient replicas exist for the pool to continue\n action: ...\n' "$FAKE_HEALTH"
+               fi ;;
+  "status tank") printf '  pool: tank\n state: %s\n  scan: %s\nconfig:\n\nerrors: No known data errors\n' "$FAKE_HEALTH" "$FAKE_SCAN" ;;
+esac
+EOF
+chmod +x "$FAKEBIN/zpool"
+zfs_line() {  # usage: zfs_line HEALTH SCAN [ERRORS [CAPACITY]]; prints the pool's status line
+  FAKE_HEALTH=$1 FAKE_SCAN=$2 FAKE_ERRORS=${3:-} FAKE_CAP=${4:-40%} PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run
+  grep '|zfs:tank|' "$STATUS"
+}
+no_zfs_line() {  # usage: no_zfs_line MODE; succeeds if the run worked and printed no zfs line
+  FAKE_MODE=$1 PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run && test -s "$STATUS" && ! grep -q '|zfs:' "$STATUS"
+}
+if command -v zpool >/dev/null; then
+  echo "  (zpool is installed here, so the not-installed case is skipped)"
+else
+  /usr/local/sbin/healthcheck run
+  check "zpool not installed (a Pi, most Debian boxes): no zfs line" bash -c "! grep -q '|zfs:' '$STATUS'"
+fi
+check "zpool installed but ZFS module not loaded: no zfs line" no_zfs_line nomodule
+check "zpool installed but no pools: no zfs line" no_zfs_line nopools
+check "a stray non-pool line from zpool isn't shown as a pool" no_zfs_line chatty
+scrubbed() { echo "scrub repaired 0B in 00:10:12 with ${2:-0} errors on $(date -d "$1 days ago" '+%a %b %e %T %Y')"; }
+l=$(zfs_line ONLINE "$(scrubbed 3)");  echo "    $l"
+check "healthy pool, recent scrub: OK with free space and scrub age" grep -qx 'OK|zfs:tank|ONLINE, 60% free, scrubbed 3 day(s) ago' <<<"$l"
+l=$(zfs_line ONLINE "$(scrubbed 3)" "" 75%); echo "    $l"
+check "75% full: still OK" grep -q '^OK|zfs:tank|ONLINE, 25% free,' <<<"$l"
+l=$(zfs_line ONLINE "$(scrubbed 3)" "" 85%); echo "    $l"
+check "85% full: warns, low for ZFS" grep -q '^WARN|zfs:tank|ONLINE, 15% free (low for ZFS),' <<<"$l"
+l=$(zfs_line ONLINE "$(scrubbed 60)"); echo "    $l"
+check "scrub older than 45 days: warns overdue" grep -q '^WARN|zfs:tank|.*overdue' <<<"$l"
+l=$(zfs_line ONLINE "$(scrubbed 2 5)"); echo "    $l"
+check "last scrub found errors: warns" grep -q '^WARN|zfs:tank|.*last scrub found 5 error' <<<"$l"
+l=$(zfs_line ONLINE "none requested"); echo "    $l"
+check "never scrubbed: info, not a warning" grep -q '^INFO|zfs:tank|.*no completed scrub' <<<"$l"
+l=$(zfs_line ONLINE "scrub in progress since $(date '+%a %b %e %T %Y')"); echo "    $l"
+check "scrub running: OK" grep -q '^OK|zfs:tank|ONLINE, 60% free, scrub running' <<<"$l"
+l=$(zfs_line ONLINE "$(scrubbed 3)" "One or more devices has experienced an unrecoverable error.  An"); echo "    $l"
+check "device errors: warns with zpool's reason (first sentence, unwrapped)" \
+  grep -qx 'WARN|zfs:tank|ONLINE, 60% free, One or more devices has experienced an unrecoverable error, scrubbed 3 day(s) ago' <<<"$l"
+check "and says where to look" grep -q 'details: sudo zpool status -v tank' "$STATUS"
+l=$(zfs_line DEGRADED "$(scrubbed 3)"); echo "    $l"
+check "degraded pool: warns with zpool's reason" \
+  grep -qx 'WARN|zfs:tank|DEGRADED, 60% free, One or more devices could not be used because the label is missing or invalid, scrubbed 3 day(s) ago' <<<"$l"
+l=$(zfs_line FAULTED "none requested"); echo "    $l"
+check "faulted pool: critical" grep -q '^CRIT|zfs:tank|FAULTED' <<<"$l"
+rm -rf "$FAKEBIN"
+
+section "ZFS pools (real ZFS)"
+ZDIR=""
+if command -v zpool >/dev/null && modprobe zfs 2>/dev/null; then
+  ZDIR=$(mktemp -d)
+  truncate -s 256M "$ZDIR/a" "$ZDIR/b"
+  zpool create -f -m "$ZDIR/mnt" hctest mirror "$ZDIR/a" "$ZDIR/b" || ZDIR=""
+fi
+if [ -n "$ZDIR" ]; then
+  zline() { /usr/local/sbin/healthcheck run; grep '|zfs:hctest|' "$STATUS"; }
+  l=$(zline); echo "    $l"
+  check "ZFS mount has no df space/inode lines (the pool line covers it)" bash -c "! grep -qF '|$ZDIR/mnt|' '$STATUS'"
+  check "new pool: online, not scrubbed yet" grep -qE '^INFO\|zfs:hctest\|ONLINE, [0-9]+% free, no completed scrub' <<<"$l"
+  zpool scrub -w hctest
+  l=$(zline); echo "    $l"
+  check "after a scrub: OK, scrubbed 0 days ago" grep -qxE 'OK\|zfs:hctest\|ONLINE, [0-9]+% free, scrubbed 0 day\(s\) ago' <<<"$l"
+  zpool offline hctest "$ZDIR/b"
+  l=$(zline); echo "    $l"
+  check "a mirror side offline: degraded warning" grep -q '^WARN|zfs:hctest|DEGRADED' <<<"$l"
+  zpool online hctest "$ZDIR/b"; zpool wait -t resilver hctest 2>/dev/null; sleep 1
+  zpool scrub -w hctest
+  dd if=/dev/urandom of="$ZDIR/b" bs=1M seek=16 count=200 conv=notrunc status=none   # corrupt one side, past the labels
+  zpool scrub -w hctest
+  l=$(zline); echo "    $l"
+  check "checksum errors repaired by a scrub still warn" grep -q '^WARN|zfs:hctest|ONLINE, .*unrecoverable error, scrubbed' <<<"$l"
+  zpool clear hctest
+  l=$(zline); echo "    $l"
+  check "after zpool clear: OK again" grep -qE '^OK\|zfs:hctest\|ONLINE, [0-9]+% free, scrubbed 0 day\(s\) ago' <<<"$l"
+  zpool destroy hctest; rm -rf "$ZDIR"
+elif [ -n "${HC_REQUIRE_ZFS:-}" ]; then
+  fail "real ZFS required (HC_REQUIRE_ZFS) but no pool could be created"
+else
+  echo "  skip real ZFS checks (ZFS not available here)"
+fi
+
+section "btrfs filesystems (fake btrfs)"
+FAKEBIN=$(mktemp -d)
+cat > "$FAKEBIN/findmnt" <<'EOF'
+#!/bin/bash
+# fake findmnt: btrfs mounts from $FAKE_MOUNTS ("UUID TARGET" lines); anything else goes to the real one
+case " $* " in *" -t btrfs "*) [ -n "${FAKE_MOUNTS:-}" ] && printf '%s\n' "$FAKE_MOUNTS"; exit 0 ;; esac
+exec /usr/bin/findmnt "$@"
+EOF
+cat > "$FAKEBIN/btrfs" <<'EOF'
+#!/bin/bash
+# fake btrfs (btrfs-progs 6.x output): size/free/ratio, missing devices, device stats, scrub status from $FAKE_*
+case "$1 $2" in
+  "filesystem usage") printf 'Overall:\n    Device size:\t\t%s\n    Device allocated:\t\t1\n    Used:\t\t\t1\n    Free (estimated):\t\t%s\t(min: 1)\n    Data ratio:\t\t\t%s\n    Metadata ratio:\t\t2.00\n' \
+                        "${FAKE_SIZE:-1073741824}" "${FAKE_FREE:-644245095}" "${FAKE_RATIO:-1.00}" ;;
+  "filesystem show")  echo "Label: none  uuid: 1111"; [ -n "${FAKE_MISSING:-}" ] && echo "	*** Some devices missing" ;;
+  "device stats")     for k in write_io read_io flush_io corruption generation; do
+                        v=0; [ "$k" = "${FAKE_ERR_KIND:-}" ] && v=$FAKE_ERR_N; printf '[/dev/sdz1].%s_errs\t%s\n' "$k" "$v"; done ;;
+  "scrub status")     printf 'UUID:             1111\n%b\n' "$FAKE_SCRUB" ;;
+esac
+EOF
+chmod +x "$FAKEBIN/findmnt" "$FAKEBIN/btrfs"
+day() { date -d "$1 days ago" '+%a %b %e %T %Y'; }
+done_scrub() {  # usage: done_scrub DAYS_AGO [ERROR_SUMMARY]
+  echo "Scrub started:    $(day "$1")\nStatus:           finished\nDuration:         0:00:05\nError summary:    ${2:-no errors found}"
+}
+btrfs_line() {  # run with fake btrfs; print the /data line (env FAKE_* set by the caller)
+  FAKE_MOUNTS=${FAKE_MOUNTS-"1111 /data"} PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run
+  grep '|btrfs:' "$STATUS"
+}
+l=$(FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "healthy: OK with free space and scrub age" grep -qx 'OK|btrfs:/data|60% free, scrubbed 3 day(s) ago' <<<"$l"
+l=$(FAKE_MOUNTS=$'1111 /data\n1111 /data/@home\n2222 /backup' FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "$l" | sed 's/^/    /'
+check "one line per filesystem, not per subvolume mount" test "$(grep -c '|btrfs:' <<<"$l")" = 2
+l=$(FAKE_FREE=85899346 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "8% free: warns low" grep -q '^WARN|btrfs:/data|8% free (low),' <<<"$l"
+l=$(FAKE_SIZE=2147483648 FAKE_FREE=524288000 FAKE_RATIO=2.00 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "RAID1: free space accounts for the data ratio" grep -q '|btrfs:/data|48% free,' <<<"$l"
+l=$(FAKE_ERR_KIND=corruption FAKE_ERR_N=3 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "device error counters warn" grep -qx 'WARN|btrfs:/data|60% free, 3 device error(s) (corruption 3), scrubbed 3 day(s) ago' <<<"$l"
+check "and say where to look" grep -q 'details: sudo btrfs device stats /data' "$STATUS"
+l=$(FAKE_MISSING=1 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "missing device: degraded warning" grep -q '^WARN|btrfs:/data|60% free, device(s) missing (degraded),' <<<"$l"
+l=$(FAKE_SCRUB='\tno stats available' btrfs_line); echo "    $l"
+check "never scrubbed: info" grep -qx 'INFO|btrfs:/data|60% free, no completed scrub on record' <<<"$l"
+l=$(FAKE_SCRUB=$(done_scrub 60) btrfs_line); echo "    $l"
+check "scrub older than 45 days: overdue" grep -q '^WARN|btrfs:/data|.*(overdue)$' <<<"$l"
+l=$(FAKE_SCRUB=$(done_scrub 2 'csum=12\n  Corrected:      12\n  Uncorrectable:  0') btrfs_line); echo "    $l"
+check "last scrub found errors: warns" grep -q '^WARN|btrfs:/data|.*last scrub found 12 error(s)$' <<<"$l"
+l=$(FAKE_SCRUB="Scrub started:    $(day 0)\nStatus:           running" btrfs_line); echo "    $l"
+check "scrub running: OK" grep -qx 'OK|btrfs:/data|60% free, scrub running' <<<"$l"
+l=$(FAKE_SCRUB="scrub status for 1111\n\tscrub started at $(day 5) and finished after 00:00:05\n\ttotal bytes scrubbed: 1.00GiB with 0 errors" btrfs_line); echo "    $l"
+check "older btrfs-progs scrub format is understood" grep -qx 'OK|btrfs:/data|60% free, scrubbed 5 day(s) ago' <<<"$l"
+FAKE_MOUNTS="" PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run
+check "btrfs-progs installed, no btrfs mounted: no btrfs line" bash -c "! grep -q '|btrfs:' '$STATUS'"
+rm -rf "$FAKEBIN"
+if command -v btrfs >/dev/null; then
+  echo "  (btrfs-progs is installed here, so the not-installed case is skipped)"
+else
+  /usr/local/sbin/healthcheck run
+  check "btrfs-progs not installed: no btrfs line" bash -c "! grep -q '|btrfs:' '$STATUS'"
+fi
+
+section "btrfs filesystems (real btrfs)"
+BDIR=""
+if command -v mkfs.btrfs >/dev/null && modprobe btrfs 2>/dev/null; then
+  BDIR=$(mktemp -d); mkdir "$BDIR/mnt"
+  truncate -s 512M "$BDIR/a" "$BDIR/b"
+  la=$(losetup -f --show "$BDIR/a"); lb=$(losetup -f --show "$BDIR/b")
+  if ! { mkfs.btrfs -q -f -d raid1 -m raid1 "$la" "$lb" && mount "$la" "$BDIR/mnt"; }; then
+    losetup -d "$la" "$lb"; rm -rf "$BDIR"; BDIR=""
+  fi
+fi
+if [ -n "$BDIR" ]; then
+  M=$BDIR/mnt
+  bline() { /usr/local/sbin/healthcheck run; grep -F "|btrfs:$M|" "$STATUS"; }
+  btrfs subvolume create "$M/sub" >/dev/null && mkdir "$BDIR/sub" && mount -o subvol=sub "$la" "$BDIR/sub"
+  l=$(bline); echo "    $l"
+  check "new filesystem: free space, not scrubbed yet" grep -qE "^INFO\|btrfs:$M\|[0-9]+% free, no completed scrub on record$" <<<"$l"
+  check "subvolume mount doesn't get its own line" bash -c "! grep -qF '|btrfs:$BDIR/sub|' '$STATUS'"
+  check "btrfs mounts have no df space/inode lines" bash -c "! grep -qF '|$M|' '$STATUS'"
+  dd if=/dev/urandom of="$M/data" bs=1M count=150 status=none; sync
+  btrfs scrub start -B "$M" >/dev/null
+  l=$(bline); echo "    $l"
+  check "after a scrub: OK, scrubbed 0 days ago" grep -qE "^OK\|btrfs:$M\|[0-9]+% free, scrubbed 0 day\(s\) ago$" <<<"$l"
+  umount "$BDIR/sub" "$M"
+  dd if=/dev/urandom of="$BDIR/b" bs=1M seek=100 count=300 conv=notrunc status=none   # corrupt one mirror, clear of the 64MiB superblock
+  losetup -c "$lb"; mount "$la" "$M"
+  btrfs scrub start -B "$M" >/dev/null 2>&1
+  l=$(bline); echo "    $l"
+  check "corruption repaired by scrub: warns with errors" grep -qE "^WARN\|btrfs:$M\|.*device error\(s\).*last scrub found [0-9]+ error\(s\)$" <<<"$l"
+  btrfs device stats -z "$M" >/dev/null; btrfs scrub start -B "$M" >/dev/null
+  l=$(bline); echo "    $l"
+  check "after reset and a clean scrub: OK again" grep -qE "^OK\|btrfs:$M\|[0-9]+% free, scrubbed 0 day\(s\) ago$" <<<"$l"
+  umount "$M"; losetup -d "$lb"; sleep 1
+  if mount -o degraded "$la" "$M" 2>/dev/null; then
+    l=$(bline); echo "    $l"
+    check "mirror device gone: degraded warning" grep -q "^WARN|btrfs:$M|.*device(s) missing (degraded)" <<<"$l"
+    umount "$M"
+  else
+    fail "could not mount the btrfs test filesystem degraded"
+  fi
+  losetup -d "$la"; rm -rf "$BDIR"
+elif [ -n "${HC_REQUIRE_BTRFS:-}" ]; then
+  fail "real btrfs required (HC_REQUIRE_BTRFS) but no filesystem could be created"
+else
+  echo "  skip real btrfs checks (btrfs-progs or loop devices not available here)"
+fi
 
 section "failed services and the ignore list"
 check "ignore list created" test -f "$IGNORE"

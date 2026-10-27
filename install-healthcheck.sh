@@ -145,6 +145,7 @@ WEEKLY=$STATE/weekly.status
 OUT=/run/healthcheck.status
 IGNORE=/etc/healthcheck/ignore-units
 PAT='I/O error|EXT4-fs error|Remounting filesystem read-only|mmc[0-9]+: .*([Tt]imeout|CRC|error)|blk_update_request|[Uu]nder-?voltage|usb [0-9.-]+: (USB disconnect|device descriptor read|device not accepting address|unable to enumerate|Cannot enable)|nvme[0-9]+: .*(timeout|reset)|ata[0-9.]+: .*(exception|failed|error)|Out of memory|oom-kill|Call trace|Hardware Error|Machine check'
+NOISE='nvme[0-9]+: Shutdown timeout set to'   # informational lines that match PAT
 mkdir -p "$STATE"
 
 alert() { echo "$(date '+%F %T') | $1" >> "$ALERTS"; }
@@ -163,7 +164,8 @@ case "${1:-run}" in
     res=$(nice -n 19 dpkg --verify 2>&1 | grep -v ' c /' | grep -vE '/var/lib/(apt/(mirrors(/partial)?|periodic)|rpimonitor/updatestatus\.txt)$')   # ignore modified config files and known DietPi/rpimonitor noise
     { date '+%F'; grep -c . <<<"$res"; [ -n "$res" ] && head -n 10 <<<"$res"; } > "$WEEKLY"
     exit 0 ;;
-  ack)       [ -s "$ALERTS" ] && { cat "$ALERTS" >> "$STATE/alerts.acked.log"; : > "$ALERTS"; } ;;
+  ack)       [ -s "$ALERTS" ] && { cat "$ALERTS" >> "$STATE/alerts.acked.log"; : > "$ALERTS"; }
+             ACKING=1 ;;   # the run below also accepts drives' current lifetime SMART counts
   run)       ;;
   *)         echo "usage: $0 [run|weekly|ack]"; exit 1 ;;
 esac
@@ -200,7 +202,7 @@ if [ "$t" -gt 0 ]; then
 fi
 
 # --- Kernel errors this boot (also saved persistently, deduped, max 20 new per run) ---
-errs=$(dmesg 2>/dev/null | grep -E "$PAT")
+errs=$(dmesg 2>/dev/null | grep -E "$PAT" | grep -vE "$NOISE")
 n=$(grep -c . <<<"$errs")
 if [ "$n" -gt 0 ]; then
   new=0
@@ -235,6 +237,9 @@ if [ -n "$eb" ]; then add WARN ext4 "errors recorded:$eb (stays until fsck clear
 elif [ "$seen" = 1 ]; then add OK ext4 "error counters are zero"; fi
 
 # --- Space and inodes, one line per mount ---
+# ZFS and btrfs (when btrfs-progs is installed) get their own lines with pool-wide free space
+DF_SKIP=(-x tmpfs -x devtmpfs -x squashfs -x overlay -x zfs)
+have btrfs && have findmnt && DF_SKIP+=(-x btrfs)
 usage_check() {  # $1=word for display ("space"|"inodes") $2=df field
   local pct mp free
   while read -r pct mp; do
@@ -246,23 +251,31 @@ usage_check() {  # $1=word for display ("space"|"inodes") $2=df field
     else
       add OK "$mp" "$free% free $1"
     fi
-  done < <(df -l -x tmpfs -x devtmpfs -x squashfs -x overlay --output="$2",target 2>/dev/null | tail -n +2)
+  done < <(df -l "${DF_SKIP[@]}" --output="$2",target 2>/dev/null | tail -n +2)
 }
 usage_check space pcent
 usage_check inodes ipcent
 
 # --- Drives ---
+attr_of() { awk -v a="$1" '$1==a {print $2; exit}' <<<"$2"; }   # value of attribute $1 in "name value" lines $2
 smart_check() {
-  local dev=/dev/$1 out bad wear used hrs msg lvl=OK
-  out=$(timeout 30 smartctl -H -A "$dev" 2>&1)
-  grep -qE 'overall-health|SMART Health Status' <<<"$out" || out=$(timeout 30 smartctl -d sat -H -A "$dev" 2>&1)
+  local dev=/dev/$1 out wear used hrs msg lvl=OK key vals acked spec a what n n0 unacked=0
+  out=$(timeout 30 smartctl -i -H -A "$dev" 2>&1)
+  grep -qE 'overall-health|SMART Health Status' <<<"$out" || out=$(timeout 30 smartctl -d sat -i -H -A "$dev" 2>&1)
   if ! grep -qE 'overall-health|SMART Health Status' <<<"$out"; then
     add INFO "$1" "no SMART support (normal for USB flash drives)"; return
   fi
   if grep -qE 'overall-health.*FAILED|Health Status: (FAILED|FAILING)' <<<"$out"; then
     add CRIT "$1" "SMART health FAILED - back up now"; return
   fi
-  bad=$(awk '$2 ~ /^(Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable|Reported_Uncorrect)$/ && $10+0>0 {printf "%s=%s ",$2,$10}' <<<"$out")
+  # sector/error counters as "name value"; some firmware (e.g. HGST) packs extra fields above the
+  # low 16 bits of the raw value, so 524291 (0x80003) means 3. If the low bits are 0, keep the raw.
+  vals=$(awk '$2 ~ /^(Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable|Reported_Uncorrect)$/ {
+    n = $10 + 0; if (n > 65535 && n % 65536 > 0) n = n % 65536; print $2, n }' <<<"$out")
+  key=$(awk -F: '/^Serial [Nn]umber:/ {gsub(/[^A-Za-z0-9._-]/, "", $2); print $2; exit}' <<<"$out")
+  key=$STATE/smart-acked/${key:-$1}
+  if [ "${ACKING:-0}" = 1 ]; then mkdir -p "${key%/*}" && printf '%s\n' "$vals" > "$key"; fi
+  acked=$(cat "$key" 2>/dev/null)
   wear=$(awk '$2 ~ /^(Wear_Leveling_Count|Media_Wearout_Indicator|Percent_Lifetime_Remain|SSD_Life_Left|Remaining_Lifetime_Perc)$/ {print $4+0; exit}' <<<"$out")
   used=$(awk -F: '/Percentage Used/ {gsub(/[ %]/,"",$2); print $2}' <<<"$out")
   hrs=$(awk '$2=="Power_On_Hours" {print $10+0; exit}' <<<"$out")
@@ -270,8 +283,26 @@ smart_check() {
   [ -n "$hrs" ]  && msg="$msg, ${hrs}h on"
   [ -n "$wear" ] && { msg="$msg, ~${wear}% life left"; [ "$wear" -lt 20 ] && lvl=WARN; }
   [ -n "$used" ] && { msg="$msg, ${used}% life used"; [ "$used" -ge 80 ] && lvl=WARN; }
-  [ -n "$bad" ]  && { msg="$msg, BAD SECTORS: $bad"; lvl=WARN; }
+  # lifetime counts never go down: warn until acked, then only when they grow
+  for spec in "Reallocated_Sector_Ct|reallocated sector(s)" "Reported_Uncorrect|uncorrectable read error(s)"; do
+    a=${spec%%|*}; what=${spec#*|}
+    n=$(attr_of "$a" "$vals"); [ "${n:-0}" -gt 0 ] || continue
+    n0=$(attr_of "$a" "$acked"); n0=${n0:-0}
+    if [ "$n" -gt "$n0" ]; then
+      msg="$msg, $n $what"; [ "$n0" -gt 0 ] && msg="$msg ($((n - n0)) new)"
+      lvl=WARN; unacked=1
+    else
+      msg="$msg, $n old $what (acked)"
+    fi
+  done
+  # sectors the drive can't read right now: always a warning
+  for spec in "Current_Pending_Sector|pending (unreadable) sector(s)" "Offline_Uncorrectable|offline-uncorrectable sector(s)"; do
+    a=${spec%%|*}; what=${spec#*|}
+    n=$(attr_of "$a" "$vals"); [ "${n:-0}" -gt 0 ] && { msg="$msg, $n $what"; lvl=WARN; }
+  done
   add "$lvl" "$1" "$msg"
+  [ "$unacked" = 1 ] && add DETAIL "" "lifetime counts never go down; once checked, accept them with: sudo healthcheck ack"
+  return 0
 }
 for d in $(lsblk -dnro NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
   case $d in
@@ -281,6 +312,94 @@ for d in $(lsblk -dnro NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
   have smartctl || { add INFO "$d" "smartctl missing (apt install smartmontools)"; continue; }
   smart_check "$d"
 done
+
+# --- ZFS pools (zpool can hang on a suspended pool, hence the timeouts) ---
+if have zpool; then
+  while read -r pool health cap _; do
+    [[ $health =~ ^[A-Z]+$ ]] || continue   # pool lines only (ONLINE, DEGRADED...)
+    st=$(timeout 30 zpool status "$pool" 2>/dev/null)
+    case $health in
+      ONLINE)   lvl=OK ;;
+      DEGRADED) lvl=WARN ;;
+      *)        lvl=CRIT ;;   # FAULTED, UNAVAIL, SUSPENDED...
+    esac
+    msg=$health
+    cap=${cap%\%}
+    if [[ $cap =~ ^[0-9]+$ ]]; then   # pool-wide, unlike df on a dataset; ZFS slows down past ~80% full
+      msg="$msg, $((100 - cap))% free"
+      if [ "$cap" -ge 80 ]; then msg="$msg (low for ZFS)"; [ "$lvl" = OK ] && lvl=WARN; fi
+    fi
+    xst=$(timeout 30 zpool status -x "$pool" 2>/dev/null)
+    if ! grep -q 'is healthy' <<<"$xst"; then
+      [ "$lvl" = OK ] && lvl=WARN
+      # zpool wraps "status:" over tab-indented lines; join them and keep the first sentence
+      why=$(awk '/^ *status: /{sub(/^ *status: /,""); s=$0; f=1; next} f && /^\t/{sub(/^\t+/," "); s=s $0; next} f{exit} END{print s}' <<<"$xst")
+      why=${why%%. *}; why=${why%.}; msg="$msg, ${why:-errors reported}"
+    fi
+    scan=$(sed -n 's/^ *scan: //p' <<<"$st" | head -n 1)
+    case $scan in
+      "scrub in progress"*)    msg="$msg, scrub running" ;;
+      "resilver in progress"*) msg="$msg, resilvering" ;;
+      "scrub repaired"*" on "*)
+        when=$(date -d "${scan##* on }" +%s 2>/dev/null)
+        if [ -n "$when" ] && [ "$(date +%s)" -ge "$when" ]; then
+          days=$(( ($(date +%s) - when) / 86400 ))
+          msg="$msg, scrubbed $days day(s) ago"
+          if [ "$days" -gt 45 ]; then msg="$msg (overdue)"; [ "$lvl" = OK ] && lvl=WARN; fi
+        fi
+        serr=$(sed -nE 's/.* with ([0-9]+) errors.*/\1/p' <<<"$scan")
+        if [ "${serr:-0}" != 0 ]; then msg="$msg, last scrub found $serr error(s)"; [ "$lvl" = OK ] && lvl=WARN; fi ;;
+      *) msg="$msg, no completed scrub on record"; [ "$lvl" = OK ] && lvl=INFO ;;
+    esac
+    add "$lvl" "zfs:$pool" "$msg"
+    case $lvl in WARN|CRIT) add DETAIL "" "details: sudo zpool status -v $pool" ;; esac
+  done < <(timeout 30 zpool list -H -o name,health,capacity 2>/dev/null)
+fi
+
+# --- btrfs filesystems (only with btrfs-progs installed); one line per filesystem, not per subvolume mount ---
+if have btrfs && have findmnt; then
+  while read -r _ mp; do   # UUID (deduped below), mountpoint
+    mp=$(printf '%b' "$mp")   # findmnt -r writes spaces as \x20
+    lvl=OK; msg=""
+    # free space: btrfs filesystem usage accounts for RAID profiles and allocated-but-empty chunks
+    use=$(timeout 30 btrfs filesystem usage -b "$mp" 2>/dev/null)
+    pct=$(awk -F: '/Device size:/ {s=$2+0} /Free \(estimated\):/ {f=$2+0} /Data ratio:/ {r=$2+0}
+      END {if (s > 0) printf "%d", f * (r > 0 ? r : 1) * 100 / s}' <<<"$use")
+    if [ -n "$pct" ]; then
+      msg="$pct% free"
+      if [ "$pct" -le 10 ]; then msg="$msg (low)"; lvl=WARN; fi
+    fi
+    if timeout 30 btrfs filesystem show "$mp" 2>/dev/null | grep -qi 'missing'; then
+      msg="$msg, device(s) missing (degraded)"; lvl=WARN
+    fi
+    # per-device error counters: lifetime, until reset with "btrfs device stats -z"
+    derr=$(timeout 30 btrfs device stats "$mp" 2>/dev/null | awk '$2 + 0 > 0 {
+        k = $1; sub(/.*\]\./, "", k); sub(/_errs$/, "", k); c[k] += $2; t += $2 }
+      END {if (t) {for (k in c) s = s (s ? ", " : "") k " " c[k]; printf "%d device error(s) (%s)", t, s}}')
+    [ -n "$derr" ] && { msg="$msg, $derr"; lvl=WARN; }
+    # last scrub; handles both the btrfs-progs >= 5.x layout and the older one-line layout
+    sc=$(timeout 30 btrfs scrub status "$mp" 2>/dev/null)
+    started=$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]+//p; s/.*scrub started at (.*) and finished after.*/\1/p' <<<"$sc" | head -n 1)
+    state=$(sed -nE 's/^[[:space:]]*Status:[[:space:]]+//p' <<<"$sc" | head -n 1)
+    grep -q 'and finished after' <<<"$sc" && state=finished
+    grep -qE 'running for|^[[:space:]]*Status:[[:space:]]+running' <<<"$sc" && state=running
+    if [ "$state" = running ]; then
+      msg="$msg, scrub running"
+    elif [ "$state" = finished ] && when=$(date -d "$started" +%s 2>/dev/null) && [ "$(date +%s)" -ge "$when" ]; then
+      days=$(( ($(date +%s) - when) / 86400 ))
+      msg="$msg, scrubbed $days day(s) ago"
+      if [ "$days" -gt 45 ]; then msg="$msg (overdue)"; [ "$lvl" = OK ] && lvl=WARN; fi
+      serr=$(awk '/Error summary:/ {for (i = 3; i <= NF; i++) if (split($i, a, "=") == 2) t += a[2]; found = 1}
+        / with [0-9]+ errors/ {for (i = 1; i < NF; i++) if ($(i+1) == "errors") t += $i; found = 1}
+        END {if (found) print t + 0}' <<<"$sc")
+      if [ "${serr:-0}" != 0 ]; then msg="$msg, last scrub found $serr error(s)"; [ "$lvl" = OK ] && lvl=WARN; fi
+    else
+      msg="$msg, no completed scrub on record"; [ "$lvl" = OK ] && lvl=INFO
+    fi
+    add "$lvl" "btrfs:$mp" "${msg#, }"
+    case $lvl in WARN|CRIT) add DETAIL "" "details: sudo btrfs device stats $mp; sudo btrfs scrub status $mp" ;; esac
+  done < <(findmnt -rn -t btrfs -o UUID,TARGET 2>/dev/null | awk '!seen[$1]++')
+fi
 
 # --- Memory, services ---
 read -r tot avail < <(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{print t,a}' /proc/meminfo)
@@ -331,7 +450,7 @@ if [ -s "$STATE/scan_boot" ]; then
     known=$(cat "$ALERTS" "$STATE/alerts.acked.log" 2>/dev/null | grep -F "| ${id:0:8} | " | sed -E 's/^[^|]*\| [^|]*\| //; s/^journal: //; s/^\[ *[0-9.]+\] //')
     while IFS= read -r l; do
       grep -qxF -- "$l" <<<"$known" || alert "${id:0:8} | journal: $l"
-    done < <(timeout 60 journalctl -q --no-pager -k -b "$id" -o cat 2>/dev/null | grep -E "$PAT" | tail -n 20)
+    done < <(timeout 60 journalctl -q --no-pager -k -b "$id" -o cat 2>/dev/null | grep -E "$PAT" | grep -vE "$NOISE" | tail -n 20)
   fi
 fi
 
