@@ -283,6 +283,44 @@ for d in $(lsblk -dnro NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
   smart_check "$d"
 done
 
+# --- ZFS pools (zpool can hang on a suspended pool, hence the timeouts) ---
+if have zpool; then
+  while read -r pool health _; do
+    [[ $health =~ ^[A-Z]+$ ]] || continue   # pool lines only (ONLINE, DEGRADED...)
+    st=$(timeout 30 zpool status "$pool" 2>/dev/null)
+    case $health in
+      ONLINE)   lvl=OK ;;
+      DEGRADED) lvl=WARN ;;
+      *)        lvl=CRIT ;;   # FAULTED, UNAVAIL, SUSPENDED...
+    esac
+    msg=$health
+    xst=$(timeout 30 zpool status -x "$pool" 2>/dev/null)
+    if ! grep -q 'is healthy' <<<"$xst"; then
+      [ "$lvl" = OK ] && lvl=WARN
+      # zpool wraps "status:" over tab-indented lines; join them and keep the first sentence
+      why=$(awk '/^ *status: /{sub(/^ *status: /,""); s=$0; f=1; next} f && /^\t/{sub(/^\t+/," "); s=s $0; next} f{exit} END{print s}' <<<"$xst")
+      why=${why%%. *}; why=${why%.}; msg="$msg, ${why:-errors reported}"
+    fi
+    scan=$(sed -n 's/^ *scan: //p' <<<"$st" | head -n 1)
+    case $scan in
+      "scrub in progress"*)    msg="$msg, scrub running" ;;
+      "resilver in progress"*) msg="$msg, resilvering" ;;
+      "scrub repaired"*" on "*)
+        when=$(date -d "${scan##* on }" +%s 2>/dev/null)
+        if [ -n "$when" ] && [ "$(date +%s)" -ge "$when" ]; then
+          days=$(( ($(date +%s) - when) / 86400 ))
+          msg="$msg, scrubbed $days day(s) ago"
+          if [ "$days" -gt 45 ]; then msg="$msg (overdue)"; [ "$lvl" = OK ] && lvl=WARN; fi
+        fi
+        serr=$(sed -nE 's/.* with ([0-9]+) errors.*/\1/p' <<<"$scan")
+        if [ "${serr:-0}" != 0 ]; then msg="$msg, last scrub found $serr error(s)"; [ "$lvl" = OK ] && lvl=WARN; fi ;;
+      *) msg="$msg, no completed scrub on record"; [ "$lvl" = OK ] && lvl=INFO ;;
+    esac
+    add "$lvl" "zfs:$pool" "$msg"
+    case $lvl in WARN|CRIT) add DETAIL "" "details: sudo zpool status -v $pool" ;; esac
+  done < <(timeout 30 zpool list -H -o name,health 2>/dev/null)
+fi
+
 # --- Memory, services ---
 read -r tot avail < <(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{print t,a}' /proc/meminfo)
 if [ -n "${tot:-}" ] && [ -n "${avail:-}" ]; then

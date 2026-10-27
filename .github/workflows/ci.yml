@@ -30,6 +30,14 @@ jobs:
       - uses: actions/checkout@v5
       - run: sudo tests/install-test.sh ${{ matrix.args }}
 
+  # same install test with ZFS available, so the real-ZFS checks run (file-backed test pool)
+  zfs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zfsutils-linux
+      - run: sudo HC_REQUIRE_ZFS=1 tests/install-test.sh --no-apt
+
   # install into a systemd container, reboot it, and check the dashboard comes back
   reboot:
     strategy:

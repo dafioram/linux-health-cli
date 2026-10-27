@@ -57,6 +57,7 @@ to `alerts.acked.log`.
 | one per mount | `df`: space, then inodes | ⚠ 10% or less free |
 | one per disk | `smartctl` (see below) | see below |
 | `memory` | `MemAvailable` | ⚠ under 10% |
+| `zfs:<pool>` | `zpool list` and `zpool status` ([see below](#zfs-pools)) | ✗ faulted/unavailable, ⚠ degraded, errors, or scrub overdue |
 | `services` | `systemctl --failed`, minus your [ignore list](#failed-services) | ⚠ any failed unit |
 | `weekly` | `dpkg --verify`, Sundays 03:30 (ignores changed config files) | ⚠ package files that differ from what was installed |
 | `history` | saved alerts from earlier boots | ⚠ any you haven't acknowledged |
@@ -97,8 +98,28 @@ are the `kernel` line (mmc timeouts and CRC errors, I/O errors), the `ext4` coun
 and a mount suddenly going read-only.
 
 Not covered: which mount lives on which disk, NVMe power-on hours and media-error
-counts, SMART self-test logs, drive temperature, and RAID or pool health (mdadm,
-btrfs, ZFS). The member disks of an mdadm array are still checked one by one.
+counts, SMART self-test logs, drive temperature, and mdadm or btrfs RAID health. The
+member disks of an mdadm array are still checked one by one.
+
+### ZFS pools
+
+Only machines that use ZFS get this. Without `zpool` (a Pi, most Debian installs),
+with no pools, or with the ZFS module not loaded, there is no `zfs` line at all. The
+installer never installs ZFS. If `zpool` is installed, each pool gets a `zfs:<pool>`
+line:
+
+| Line | Level |
+|---|---|
+| `ONLINE, scrubbed 12 day(s) ago` | ✓ |
+| `ONLINE, scrub running` | ✓ |
+| `ONLINE, no completed scrub on record` | · run `sudo zpool scrub <pool>` once |
+| `ONLINE, scrubbed 60 day(s) ago (overdue)` | ⚠ more than 45 days. Ubuntu and Debian scrub monthly by default. |
+| `ONLINE, last scrub found 2 error(s)` | ⚠ |
+| `ONLINE, One or more devices has experienced an unrecoverable error` | ⚠ any pool `zpool status -x` doesn't call healthy, with its reason. Checksum errors stay until `zpool clear`. |
+| `DEGRADED, ...` | ⚠ |
+| `FAULTED, ...` (or `UNAVAIL`, `SUSPENDED`) | ✗ |
+
+Any warning adds `details: sudo zpool status -v <pool>`.
 
 ### Failed services
 
