@@ -237,6 +237,9 @@ if [ -n "$eb" ]; then add WARN ext4 "errors recorded:$eb (stays until fsck clear
 elif [ "$seen" = 1 ]; then add OK ext4 "error counters are zero"; fi
 
 # --- Space and inodes, one line per mount ---
+# ZFS and btrfs (when btrfs-progs is installed) get their own lines with pool-wide free space
+DF_SKIP=(-x tmpfs -x devtmpfs -x squashfs -x overlay -x zfs)
+have btrfs && have findmnt && DF_SKIP+=(-x btrfs)
 usage_check() {  # $1=word for display ("space"|"inodes") $2=df field
   local pct mp free
   while read -r pct mp; do
@@ -248,7 +251,7 @@ usage_check() {  # $1=word for display ("space"|"inodes") $2=df field
     else
       add OK "$mp" "$free% free $1"
     fi
-  done < <(df -l -x tmpfs -x devtmpfs -x squashfs -x overlay -x zfs --output="$2",target 2>/dev/null | tail -n +2)   # ZFS: see the pool line
+  done < <(df -l "${DF_SKIP[@]}" --output="$2",target 2>/dev/null | tail -n +2)
 }
 usage_check space pcent
 usage_check inodes ipcent
@@ -351,6 +354,51 @@ if have zpool; then
     add "$lvl" "zfs:$pool" "$msg"
     case $lvl in WARN|CRIT) add DETAIL "" "details: sudo zpool status -v $pool" ;; esac
   done < <(timeout 30 zpool list -H -o name,health,capacity 2>/dev/null)
+fi
+
+# --- btrfs filesystems (only with btrfs-progs installed); one line per filesystem, not per subvolume mount ---
+if have btrfs && have findmnt; then
+  while read -r _ mp; do   # UUID (deduped below), mountpoint
+    mp=$(printf '%b' "$mp")   # findmnt -r writes spaces as \x20
+    lvl=OK; msg=""
+    # free space: btrfs filesystem usage accounts for RAID profiles and allocated-but-empty chunks
+    use=$(timeout 30 btrfs filesystem usage -b "$mp" 2>/dev/null)
+    pct=$(awk -F: '/Device size:/ {s=$2+0} /Free \(estimated\):/ {f=$2+0} /Data ratio:/ {r=$2+0}
+      END {if (s > 0) printf "%d", f * (r > 0 ? r : 1) * 100 / s}' <<<"$use")
+    if [ -n "$pct" ]; then
+      msg="$pct% free"
+      if [ "$pct" -le 10 ]; then msg="$msg (low)"; lvl=WARN; fi
+    fi
+    if timeout 30 btrfs filesystem show "$mp" 2>/dev/null | grep -qi 'missing'; then
+      msg="$msg, device(s) missing (degraded)"; lvl=WARN
+    fi
+    # per-device error counters: lifetime, until reset with "btrfs device stats -z"
+    derr=$(timeout 30 btrfs device stats "$mp" 2>/dev/null | awk '$2 + 0 > 0 {
+        k = $1; sub(/.*\]\./, "", k); sub(/_errs$/, "", k); c[k] += $2; t += $2 }
+      END {if (t) {for (k in c) s = s (s ? ", " : "") k " " c[k]; printf "%d device error(s) (%s)", t, s}}')
+    [ -n "$derr" ] && { msg="$msg, $derr"; lvl=WARN; }
+    # last scrub; handles both the btrfs-progs >= 5.x layout and the older one-line layout
+    sc=$(timeout 30 btrfs scrub status "$mp" 2>/dev/null)
+    started=$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]+//p; s/.*scrub started at (.*) and finished after.*/\1/p' <<<"$sc" | head -n 1)
+    state=$(sed -nE 's/^[[:space:]]*Status:[[:space:]]+//p' <<<"$sc" | head -n 1)
+    grep -q 'and finished after' <<<"$sc" && state=finished
+    grep -qE 'running for|^[[:space:]]*Status:[[:space:]]+running' <<<"$sc" && state=running
+    if [ "$state" = running ]; then
+      msg="$msg, scrub running"
+    elif [ "$state" = finished ] && when=$(date -d "$started" +%s 2>/dev/null) && [ "$(date +%s)" -ge "$when" ]; then
+      days=$(( ($(date +%s) - when) / 86400 ))
+      msg="$msg, scrubbed $days day(s) ago"
+      if [ "$days" -gt 45 ]; then msg="$msg (overdue)"; [ "$lvl" = OK ] && lvl=WARN; fi
+      serr=$(awk '/Error summary:/ {for (i = 3; i <= NF; i++) if (split($i, a, "=") == 2) t += a[2]; found = 1}
+        / with [0-9]+ errors/ {for (i = 1; i < NF; i++) if ($(i+1) == "errors") t += $i; found = 1}
+        END {if (found) print t + 0}' <<<"$sc")
+      if [ "${serr:-0}" != 0 ]; then msg="$msg, last scrub found $serr error(s)"; [ "$lvl" = OK ] && lvl=WARN; fi
+    else
+      msg="$msg, no completed scrub on record"; [ "$lvl" = OK ] && lvl=INFO
+    fi
+    add "$lvl" "btrfs:$mp" "${msg#, }"
+    case $lvl in WARN|CRIT) add DETAIL "" "details: sudo btrfs device stats $mp; sudo btrfs scrub status $mp" ;; esac
+  done < <(findmnt -rn -t btrfs -o UUID,TARGET 2>/dev/null | awk '!seen[$1]++')
 fi
 
 # --- Memory, services ---

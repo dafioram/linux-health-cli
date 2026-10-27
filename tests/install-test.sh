@@ -309,6 +309,114 @@ else
   echo "  skip real ZFS checks (ZFS not available here)"
 fi
 
+section "btrfs filesystems (fake btrfs)"
+FAKEBIN=$(mktemp -d)
+cat > "$FAKEBIN/findmnt" <<'EOF'
+#!/bin/bash
+# fake findmnt: btrfs mounts from $FAKE_MOUNTS ("UUID TARGET" lines); anything else goes to the real one
+case " $* " in *" -t btrfs "*) [ -n "${FAKE_MOUNTS:-}" ] && printf '%s\n' "$FAKE_MOUNTS"; exit 0 ;; esac
+exec /usr/bin/findmnt "$@"
+EOF
+cat > "$FAKEBIN/btrfs" <<'EOF'
+#!/bin/bash
+# fake btrfs (btrfs-progs 6.x output): size/free/ratio, missing devices, device stats, scrub status from $FAKE_*
+case "$1 $2" in
+  "filesystem usage") printf 'Overall:\n    Device size:\t\t%s\n    Device allocated:\t\t1\n    Used:\t\t\t1\n    Free (estimated):\t\t%s\t(min: 1)\n    Data ratio:\t\t\t%s\n    Metadata ratio:\t\t2.00\n' \
+                        "${FAKE_SIZE:-1073741824}" "${FAKE_FREE:-644245095}" "${FAKE_RATIO:-1.00}" ;;
+  "filesystem show")  echo "Label: none  uuid: 1111"; [ -n "${FAKE_MISSING:-}" ] && echo "	*** Some devices missing" ;;
+  "device stats")     for k in write_io read_io flush_io corruption generation; do
+                        v=0; [ "$k" = "${FAKE_ERR_KIND:-}" ] && v=$FAKE_ERR_N; printf '[/dev/sdz1].%s_errs\t%s\n' "$k" "$v"; done ;;
+  "scrub status")     printf 'UUID:             1111\n%b\n' "$FAKE_SCRUB" ;;
+esac
+EOF
+chmod +x "$FAKEBIN/findmnt" "$FAKEBIN/btrfs"
+day() { date -d "$1 days ago" '+%a %b %e %T %Y'; }
+done_scrub() {  # usage: done_scrub DAYS_AGO [ERROR_SUMMARY]
+  echo "Scrub started:    $(day "$1")\nStatus:           finished\nDuration:         0:00:05\nError summary:    ${2:-no errors found}"
+}
+btrfs_line() {  # run with fake btrfs; print the /data line (env FAKE_* set by the caller)
+  FAKE_MOUNTS=${FAKE_MOUNTS-"1111 /data"} PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run
+  grep '|btrfs:' "$STATUS"
+}
+l=$(FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "healthy: OK with free space and scrub age" grep -qx 'OK|btrfs:/data|60% free, scrubbed 3 day(s) ago' <<<"$l"
+l=$(FAKE_MOUNTS=$'1111 /data\n1111 /data/@home\n2222 /backup' FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "$l" | sed 's/^/    /'
+check "one line per filesystem, not per subvolume mount" test "$(grep -c '|btrfs:' <<<"$l")" = 2
+l=$(FAKE_FREE=85899346 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "8% free: warns low" grep -q '^WARN|btrfs:/data|8% free (low),' <<<"$l"
+l=$(FAKE_SIZE=2147483648 FAKE_FREE=524288000 FAKE_RATIO=2.00 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "RAID1: free space accounts for the data ratio" grep -q '|btrfs:/data|48% free,' <<<"$l"
+l=$(FAKE_ERR_KIND=corruption FAKE_ERR_N=3 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "device error counters warn" grep -qx 'WARN|btrfs:/data|60% free, 3 device error(s) (corruption 3), scrubbed 3 day(s) ago' <<<"$l"
+check "and say where to look" grep -q 'details: sudo btrfs device stats /data' "$STATUS"
+l=$(FAKE_MISSING=1 FAKE_SCRUB=$(done_scrub 3) btrfs_line); echo "    $l"
+check "missing device: degraded warning" grep -q '^WARN|btrfs:/data|60% free, device(s) missing (degraded),' <<<"$l"
+l=$(FAKE_SCRUB='\tno stats available' btrfs_line); echo "    $l"
+check "never scrubbed: info" grep -qx 'INFO|btrfs:/data|60% free, no completed scrub on record' <<<"$l"
+l=$(FAKE_SCRUB=$(done_scrub 60) btrfs_line); echo "    $l"
+check "scrub older than 45 days: overdue" grep -q '^WARN|btrfs:/data|.*(overdue)$' <<<"$l"
+l=$(FAKE_SCRUB=$(done_scrub 2 'csum=12\n  Corrected:      12\n  Uncorrectable:  0') btrfs_line); echo "    $l"
+check "last scrub found errors: warns" grep -q '^WARN|btrfs:/data|.*last scrub found 12 error(s)$' <<<"$l"
+l=$(FAKE_SCRUB="Scrub started:    $(day 0)\nStatus:           running" btrfs_line); echo "    $l"
+check "scrub running: OK" grep -qx 'OK|btrfs:/data|60% free, scrub running' <<<"$l"
+l=$(FAKE_SCRUB="scrub status for 1111\n\tscrub started at $(day 5) and finished after 00:00:05\n\ttotal bytes scrubbed: 1.00GiB with 0 errors" btrfs_line); echo "    $l"
+check "older btrfs-progs scrub format is understood" grep -qx 'OK|btrfs:/data|60% free, scrubbed 5 day(s) ago' <<<"$l"
+FAKE_MOUNTS="" PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run
+check "btrfs-progs installed, no btrfs mounted: no btrfs line" bash -c "! grep -q '|btrfs:' '$STATUS'"
+rm -rf "$FAKEBIN"
+if command -v btrfs >/dev/null; then
+  echo "  (btrfs-progs is installed here, so the not-installed case is skipped)"
+else
+  /usr/local/sbin/healthcheck run
+  check "btrfs-progs not installed: no btrfs line" bash -c "! grep -q '|btrfs:' '$STATUS'"
+fi
+
+section "btrfs filesystems (real btrfs)"
+BDIR=""
+if command -v mkfs.btrfs >/dev/null && modprobe btrfs 2>/dev/null; then
+  BDIR=$(mktemp -d); mkdir "$BDIR/mnt"
+  truncate -s 512M "$BDIR/a" "$BDIR/b"
+  la=$(losetup -f --show "$BDIR/a"); lb=$(losetup -f --show "$BDIR/b")
+  if ! { mkfs.btrfs -q -f -d raid1 -m raid1 "$la" "$lb" && mount "$la" "$BDIR/mnt"; }; then
+    losetup -d "$la" "$lb"; rm -rf "$BDIR"; BDIR=""
+  fi
+fi
+if [ -n "$BDIR" ]; then
+  M=$BDIR/mnt
+  bline() { /usr/local/sbin/healthcheck run; grep -F "|btrfs:$M|" "$STATUS"; }
+  btrfs subvolume create "$M/sub" >/dev/null && mkdir "$BDIR/sub" && mount -o subvol=sub "$la" "$BDIR/sub"
+  l=$(bline); echo "    $l"
+  check "new filesystem: free space, not scrubbed yet" grep -qE "^INFO\|btrfs:$M\|[0-9]+% free, no completed scrub on record$" <<<"$l"
+  check "subvolume mount doesn't get its own line" bash -c "! grep -qF '|btrfs:$BDIR/sub|' '$STATUS'"
+  check "btrfs mounts have no df space/inode lines" bash -c "! grep -qF '|$M|' '$STATUS'"
+  dd if=/dev/urandom of="$M/data" bs=1M count=150 status=none; sync
+  btrfs scrub start -B "$M" >/dev/null
+  l=$(bline); echo "    $l"
+  check "after a scrub: OK, scrubbed 0 days ago" grep -qE "^OK\|btrfs:$M\|[0-9]+% free, scrubbed 0 day\(s\) ago$" <<<"$l"
+  umount "$BDIR/sub" "$M"
+  dd if=/dev/urandom of="$BDIR/b" bs=1M seek=100 count=300 conv=notrunc status=none   # corrupt one mirror, clear of the 64MiB superblock
+  losetup -c "$lb"; mount "$la" "$M"
+  btrfs scrub start -B "$M" >/dev/null 2>&1
+  l=$(bline); echo "    $l"
+  check "corruption repaired by scrub: warns with errors" grep -qE "^WARN\|btrfs:$M\|.*device error\(s\).*last scrub found [0-9]+ error\(s\)$" <<<"$l"
+  btrfs device stats -z "$M" >/dev/null; btrfs scrub start -B "$M" >/dev/null
+  l=$(bline); echo "    $l"
+  check "after reset and a clean scrub: OK again" grep -qE "^OK\|btrfs:$M\|[0-9]+% free, scrubbed 0 day\(s\) ago$" <<<"$l"
+  umount "$M"; losetup -d "$lb"; sleep 1
+  if mount -o degraded "$la" "$M" 2>/dev/null; then
+    l=$(bline); echo "    $l"
+    check "mirror device gone: degraded warning" grep -q "^WARN|btrfs:$M|.*device(s) missing (degraded)" <<<"$l"
+    umount "$M"
+  else
+    fail "could not mount the btrfs test filesystem degraded"
+  fi
+  losetup -d "$la"; rm -rf "$BDIR"
+elif [ -n "${HC_REQUIRE_BTRFS:-}" ]; then
+  fail "real btrfs required (HC_REQUIRE_BTRFS) but no filesystem could be created"
+else
+  echo "  skip real btrfs checks (btrfs-progs or loop devices not available here)"
+fi
+
 section "failed services and the ignore list"
 check "ignore list created" test -f "$IGNORE"
 printf '[Service]\nType=oneshot\nExecStart=/bin/false\n' > /etc/systemd/system/hc-test-fail.service

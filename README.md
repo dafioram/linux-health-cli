@@ -55,10 +55,11 @@ counts (see [Bad sectors and read errors](#bad-sectors-and-read-errors)).
 | `kernel` | `dmesg` this boot, plus the journal after a crash ([see below](#how-it-works)): I/O errors, ext4 errors, read-only remounts, SD/eMMC timeouts and CRC errors, NVMe resets, ATA errors, USB disconnects, undervoltage, OOM kills, call traces, machine checks | ⚠ any match (shows the latest 3) |
 | `mounts` | `/proc/mounts` for ext2/3/4, btrfs, xfs, f2fs, vfat, exfat, ntfs3 | ✗ any of them mounted read-only |
 | `ext4` | `/sys/fs/ext4/*/errors_count` | ⚠ any count above zero (stays until `fsck` clears it) |
-| one per mount | `df`: space, then inodes (ZFS mounts: see the pool line) | ⚠ 10% or less free |
+| one per mount | `df`: space, then inodes (ZFS and btrfs mounts: see their own lines) | ⚠ 10% or less free |
 | one per disk | `smartctl` (see below) | see below |
 | `memory` | `MemAvailable` | ⚠ under 10% |
 | `zfs:<pool>` | `zpool list` and `zpool status` ([see below](#zfs-pools)) | ✗ faulted/unavailable, ⚠ degraded, errors, or scrub overdue |
+| `btrfs:<mount>` | `btrfs filesystem usage`, `device stats`, `scrub status` ([see below](#btrfs-filesystems)) | ⚠ low space, missing device, device errors, or scrub overdue |
 | `services` | `systemctl --failed`, minus your [ignore list](#failed-services) | ⚠ any failed unit |
 | `weekly` | `dpkg --verify`, Sundays 03:30 (ignores changed config files) | ⚠ package files that differ from what was installed |
 | `history` | saved alerts from earlier boots | ⚠ any you haven't acknowledged |
@@ -71,8 +72,9 @@ Disks show up in two places on the dashboard.
 
 - Space and inodes, one line each. Only local filesystems are checked. tmpfs,
   devtmpfs, squashfs and overlay are skipped, and so is ZFS: its free space is on
-  the [pool line](#zfs-pools) instead. Filesystems with no inode count
-  (vfat, btrfs) only get a space line.
+  the [pool line](#zfs-pools) instead. btrfs is skipped too when btrfs-progs is
+  installed, for its [own line](#btrfs-filesystems). Filesystems with no inode count
+  (vfat, btrfs without btrfs-progs) only get a space line.
 - Read-only status. All read-only mounts are listed together on the `mounts` line.
   The kernel remounts a filesystem read-only when it hits errors, so this is CRIT.
 - ext4 error counters, listed together on the `ext4` line by device (e.g. `mmcblk0p2=3`).
@@ -121,7 +123,7 @@ are the `kernel` line (mmc timeouts and CRC errors, I/O errors), the `ext4` coun
 and a mount suddenly going read-only.
 
 Not covered: which mount lives on which disk, NVMe power-on hours and media-error
-counts, SMART self-test logs, drive temperature, and mdadm or btrfs RAID health. The
+counts, SMART self-test logs, drive temperature, and mdadm RAID health. The
 member disks of an mdadm array are still checked one by one.
 
 ### ZFS pools
@@ -149,6 +151,33 @@ Free space comes from `zpool list`, which counts the whole pool. `df` on a ZFS
 dataset only shows that dataset's view, and a pool with several datasets would get
 several lines that disagree, so ZFS mounts don't get `df` lines. A dataset that
 fills up its own `quota` isn't flagged.
+
+### btrfs filesystems
+
+Like ZFS, this only appears where it applies. Without btrfs-progs (the `btrfs`
+command) or without a mounted btrfs filesystem, there is no `btrfs` line. Each
+filesystem gets one `btrfs:<mountpoint>` line, named after its first mount, however
+many subvolumes are mounted from it:
+
+| Line | Level |
+|---|---|
+| `60% free, scrubbed 12 day(s) ago` | ✓ |
+| `60% free, scrub running` | ✓ |
+| `8% free (low), ...` | ⚠ 10% or less free |
+| `60% free, no completed scrub on record` | · run `sudo btrfs scrub start /mountpoint` once |
+| `60% free, scrubbed 60 day(s) ago (overdue)` | ⚠ more than 45 days. Debian and Ubuntu don't schedule btrfs scrubs by default; the `btrfsmaintenance` package can. |
+| `60% free, last scrub found 12 error(s)` | ⚠ |
+| `60% free, 3 device error(s) (corruption 3), ...` | ⚠ any non-zero `btrfs device stats` counter (read, write, flush, corruption, generation) |
+| `60% free, device(s) missing (degraded), ...` | ⚠ |
+
+Any warning adds `details: sudo btrfs device stats <mount>; sudo btrfs scrub status <mount>`.
+The device error counters are lifetime counts that stay until you reset them. Once
+the cause is fixed (often a cable or a failing disk), reset them with
+`sudo btrfs device stats -z <mount>`.
+
+Free space comes from `btrfs filesystem usage`, so it accounts for RAID profiles
+(RAID1 stores everything twice) and for space btrfs has allocated but not filled.
+Plain `df` often gets btrfs wrong.
 
 ### Failed services
 
