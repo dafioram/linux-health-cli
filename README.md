@@ -54,7 +54,7 @@ to `alerts.acked.log`.
 | `kernel` | `dmesg` this boot, plus the journal after a crash ([see below](#how-it-works)): I/O errors, ext4 errors, read-only remounts, SD/eMMC timeouts and CRC errors, NVMe resets, ATA errors, USB disconnects, undervoltage, OOM kills, call traces, machine checks | ⚠ any match (shows the latest 3) |
 | `mounts` | `/proc/mounts` for ext2/3/4, btrfs, xfs, f2fs, vfat, exfat, ntfs3 | ✗ any of them mounted read-only |
 | `ext4` | `/sys/fs/ext4/*/errors_count` | ⚠ any count above zero (stays until `fsck` clears it) |
-| one per mount | `df`: space, then inodes | ⚠ 10% or less free |
+| one per mount | `df`: space, then inodes (ZFS mounts: see the pool line) | ⚠ 10% or less free |
 | one per disk | `smartctl` (see below) | see below |
 | `memory` | `MemAvailable` | ⚠ under 10% |
 | `zfs:<pool>` | `zpool list` and `zpool status` ([see below](#zfs-pools)) | ✗ faulted/unavailable, ⚠ degraded, errors, or scrub overdue |
@@ -69,7 +69,8 @@ Disks show up in two places on the dashboard.
 **Per mount point** (labelled by path, e.g. `/`, `/boot/efi`):
 
 - Space and inodes, one line each. Only local filesystems are checked. tmpfs,
-  devtmpfs, squashfs and overlay are skipped. Filesystems with no inode count
+  devtmpfs, squashfs and overlay are skipped, and so is ZFS: its free space is on
+  the [pool line](#zfs-pools) instead. Filesystems with no inode count
   (vfat, btrfs) only get a space line.
 - Read-only status. All read-only mounts are listed together on the `mounts` line.
   The kernel remounts a filesystem read-only when it hits errors, so this is CRIT.
@@ -106,13 +107,14 @@ member disks of an mdadm array are still checked one by one.
 Only machines that use ZFS get this. Without `zpool` (a Pi, most Debian installs),
 with no pools, or with the ZFS module not loaded, there is no `zfs` line at all. The
 installer never installs ZFS. If `zpool` is installed, each pool gets a `zfs:<pool>`
-line:
+line with the pool's health, its free space, and its last scrub:
 
 | Line | Level |
 |---|---|
-| `ONLINE, scrubbed 12 day(s) ago` | ✓ |
-| `ONLINE, scrub running` | ✓ |
-| `ONLINE, no completed scrub on record` | · run `sudo zpool scrub <pool>` once |
+| `ONLINE, 25% free, scrubbed 12 day(s) ago` | ✓ |
+| `ONLINE, 15% free (low for ZFS), ...` | ⚠ 20% or less free. ZFS slows down well before it is full. |
+| `ONLINE, 25% free, scrub running` | ✓ |
+| `ONLINE, 25% free, no completed scrub on record` | · run `sudo zpool scrub <pool>` once |
 | `ONLINE, scrubbed 60 day(s) ago (overdue)` | ⚠ more than 45 days. Ubuntu and Debian scrub monthly by default. |
 | `ONLINE, last scrub found 2 error(s)` | ⚠ |
 | `ONLINE, One or more devices has experienced an unrecoverable error` | ⚠ any pool `zpool status -x` doesn't call healthy, with its reason. Checksum errors stay until `zpool clear`. |
@@ -120,6 +122,11 @@ line:
 | `FAULTED, ...` (or `UNAVAIL`, `SUSPENDED`) | ✗ |
 
 Any warning adds `details: sudo zpool status -v <pool>`.
+
+Free space comes from `zpool list`, which counts the whole pool. `df` on a ZFS
+dataset only shows that dataset's view, and a pool with several datasets would get
+several lines that disagree, so ZFS mounts don't get `df` lines. A dataset that
+fills up its own `quota` isn't flagged.
 
 ### Failed services
 

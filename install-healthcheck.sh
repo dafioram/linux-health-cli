@@ -247,7 +247,7 @@ usage_check() {  # $1=word for display ("space"|"inodes") $2=df field
     else
       add OK "$mp" "$free% free $1"
     fi
-  done < <(df -l -x tmpfs -x devtmpfs -x squashfs -x overlay --output="$2",target 2>/dev/null | tail -n +2)
+  done < <(df -l -x tmpfs -x devtmpfs -x squashfs -x overlay -x zfs --output="$2",target 2>/dev/null | tail -n +2)   # ZFS: see the pool line
 }
 usage_check space pcent
 usage_check inodes ipcent
@@ -285,7 +285,7 @@ done
 
 # --- ZFS pools (zpool can hang on a suspended pool, hence the timeouts) ---
 if have zpool; then
-  while read -r pool health _; do
+  while read -r pool health cap _; do
     [[ $health =~ ^[A-Z]+$ ]] || continue   # pool lines only (ONLINE, DEGRADED...)
     st=$(timeout 30 zpool status "$pool" 2>/dev/null)
     case $health in
@@ -294,6 +294,11 @@ if have zpool; then
       *)        lvl=CRIT ;;   # FAULTED, UNAVAIL, SUSPENDED...
     esac
     msg=$health
+    cap=${cap%\%}
+    if [[ $cap =~ ^[0-9]+$ ]]; then   # pool-wide, unlike df on a dataset; ZFS slows down past ~80% full
+      msg="$msg, $((100 - cap))% free"
+      if [ "$cap" -ge 80 ]; then msg="$msg (low for ZFS)"; [ "$lvl" = OK ] && lvl=WARN; fi
+    fi
     xst=$(timeout 30 zpool status -x "$pool" 2>/dev/null)
     if ! grep -q 'is healthy' <<<"$xst"; then
       [ "$lvl" = OK ] && lvl=WARN
@@ -318,7 +323,7 @@ if have zpool; then
     esac
     add "$lvl" "zfs:$pool" "$msg"
     case $lvl in WARN|CRIT) add DETAIL "" "details: sudo zpool status -v $pool" ;; esac
-  done < <(timeout 30 zpool list -H -o name,health 2>/dev/null)
+  done < <(timeout 30 zpool list -H -o name,health,capacity 2>/dev/null)
 fi
 
 # --- Memory, services ---

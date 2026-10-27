@@ -162,14 +162,14 @@ section "ZFS pools (fake zpool)"
 FAKEBIN=$(mktemp -d)
 cat > "$FAKEBIN/zpool" <<'EOF'
 #!/bin/bash
-# fake zpool: one pool "tank" in state $FAKE_HEALTH whose last scan line is $FAKE_SCAN
+# fake zpool: one pool "tank" in state $FAKE_HEALTH, $FAKE_CAP full, last scan line $FAKE_SCAN
 case "${FAKE_MODE:-}" in   # machines where ZFS isn't really in use
   nomodule) echo "The ZFS modules are not loaded." >&2; exit 1 ;;
   nopools)  exit 0 ;;
   chatty)   echo "no pools available"; exit 0 ;;
 esac
 case "$1 $2" in
-  "list -H") printf 'tank\t%s\n' "$FAKE_HEALTH" ;;
+  "list -H") printf 'tank\t%s\t%s\n' "$FAKE_HEALTH" "${FAKE_CAP:-40%}" ;;
   "status -x") if [ "$FAKE_HEALTH" = ONLINE ] && [ -z "${FAKE_ERRORS:-}" ]; then echo "pool 'tank' is healthy"
                elif [ -n "${FAKE_ERRORS:-}" ]; then   # wrapped like the real thing
                  printf '  pool: tank\n state: %s\nstatus: %s\n\tattempt was made to correct the error.\n action: ...\n' "$FAKE_HEALTH" "$FAKE_ERRORS"
@@ -180,8 +180,8 @@ case "$1 $2" in
 esac
 EOF
 chmod +x "$FAKEBIN/zpool"
-zfs_line() {  # usage: zfs_line HEALTH SCAN [ERRORS]; prints the pool's status line
-  FAKE_HEALTH=$1 FAKE_SCAN=$2 FAKE_ERRORS=${3:-} PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run
+zfs_line() {  # usage: zfs_line HEALTH SCAN [ERRORS [CAPACITY]]; prints the pool's status line
+  FAKE_HEALTH=$1 FAKE_SCAN=$2 FAKE_ERRORS=${3:-} FAKE_CAP=${4:-40%} PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck run
   grep '|zfs:tank|' "$STATUS"
 }
 no_zfs_line() {  # usage: no_zfs_line MODE; succeeds if the run worked and printed no zfs line
@@ -198,7 +198,11 @@ check "zpool installed but no pools: no zfs line" no_zfs_line nopools
 check "a stray non-pool line from zpool isn't shown as a pool" no_zfs_line chatty
 scrubbed() { echo "scrub repaired 0B in 00:10:12 with ${2:-0} errors on $(date -d "$1 days ago" '+%a %b %e %T %Y')"; }
 l=$(zfs_line ONLINE "$(scrubbed 3)");  echo "    $l"
-check "healthy pool, recent scrub: OK with its age" grep -qx 'OK|zfs:tank|ONLINE, scrubbed 3 day(s) ago' <<<"$l"
+check "healthy pool, recent scrub: OK with free space and scrub age" grep -qx 'OK|zfs:tank|ONLINE, 60% free, scrubbed 3 day(s) ago' <<<"$l"
+l=$(zfs_line ONLINE "$(scrubbed 3)" "" 75%); echo "    $l"
+check "75% full: still OK" grep -q '^OK|zfs:tank|ONLINE, 25% free,' <<<"$l"
+l=$(zfs_line ONLINE "$(scrubbed 3)" "" 85%); echo "    $l"
+check "85% full: warns, low for ZFS" grep -q '^WARN|zfs:tank|ONLINE, 15% free (low for ZFS),' <<<"$l"
 l=$(zfs_line ONLINE "$(scrubbed 60)"); echo "    $l"
 check "scrub older than 45 days: warns overdue" grep -q '^WARN|zfs:tank|.*overdue' <<<"$l"
 l=$(zfs_line ONLINE "$(scrubbed 2 5)"); echo "    $l"
@@ -206,14 +210,14 @@ check "last scrub found errors: warns" grep -q '^WARN|zfs:tank|.*last scrub foun
 l=$(zfs_line ONLINE "none requested"); echo "    $l"
 check "never scrubbed: info, not a warning" grep -q '^INFO|zfs:tank|.*no completed scrub' <<<"$l"
 l=$(zfs_line ONLINE "scrub in progress since $(date '+%a %b %e %T %Y')"); echo "    $l"
-check "scrub running: OK" grep -q '^OK|zfs:tank|ONLINE, scrub running' <<<"$l"
+check "scrub running: OK" grep -q '^OK|zfs:tank|ONLINE, 60% free, scrub running' <<<"$l"
 l=$(zfs_line ONLINE "$(scrubbed 3)" "One or more devices has experienced an unrecoverable error.  An"); echo "    $l"
 check "device errors: warns with zpool's reason (first sentence, unwrapped)" \
-  grep -qx 'WARN|zfs:tank|ONLINE, One or more devices has experienced an unrecoverable error, scrubbed 3 day(s) ago' <<<"$l"
+  grep -qx 'WARN|zfs:tank|ONLINE, 60% free, One or more devices has experienced an unrecoverable error, scrubbed 3 day(s) ago' <<<"$l"
 check "and says where to look" grep -q 'details: sudo zpool status -v tank' "$STATUS"
 l=$(zfs_line DEGRADED "$(scrubbed 3)"); echo "    $l"
 check "degraded pool: warns with zpool's reason" \
-  grep -qx 'WARN|zfs:tank|DEGRADED, One or more devices could not be used because the label is missing or invalid, scrubbed 3 day(s) ago' <<<"$l"
+  grep -qx 'WARN|zfs:tank|DEGRADED, 60% free, One or more devices could not be used because the label is missing or invalid, scrubbed 3 day(s) ago' <<<"$l"
 l=$(zfs_line FAULTED "none requested"); echo "    $l"
 check "faulted pool: critical" grep -q '^CRIT|zfs:tank|FAULTED' <<<"$l"
 rm -rf "$FAKEBIN"
@@ -223,15 +227,16 @@ ZDIR=""
 if command -v zpool >/dev/null && modprobe zfs 2>/dev/null; then
   ZDIR=$(mktemp -d)
   truncate -s 256M "$ZDIR/a" "$ZDIR/b"
-  zpool create -f -m none hctest mirror "$ZDIR/a" "$ZDIR/b" || ZDIR=""
+  zpool create -f -m "$ZDIR/mnt" hctest mirror "$ZDIR/a" "$ZDIR/b" || ZDIR=""
 fi
 if [ -n "$ZDIR" ]; then
   zline() { /usr/local/sbin/healthcheck run; grep '|zfs:hctest|' "$STATUS"; }
   l=$(zline); echo "    $l"
-  check "new pool: online, not scrubbed yet" grep -q '^INFO|zfs:hctest|ONLINE, no completed scrub' <<<"$l"
+  check "ZFS mount has no df space/inode lines (the pool line covers it)" bash -c "! grep -qF '|$ZDIR/mnt|' '$STATUS'"
+  check "new pool: online, not scrubbed yet" grep -qE '^INFO\|zfs:hctest\|ONLINE, [0-9]+% free, no completed scrub' <<<"$l"
   zpool scrub -w hctest
   l=$(zline); echo "    $l"
-  check "after a scrub: OK, scrubbed 0 days ago" grep -qx 'OK|zfs:hctest|ONLINE, scrubbed 0 day(s) ago' <<<"$l"
+  check "after a scrub: OK, scrubbed 0 days ago" grep -qxE 'OK\|zfs:hctest\|ONLINE, [0-9]+% free, scrubbed 0 day\(s\) ago' <<<"$l"
   zpool offline hctest "$ZDIR/b"
   l=$(zline); echo "    $l"
   check "a mirror side offline: degraded warning" grep -q '^WARN|zfs:hctest|DEGRADED' <<<"$l"
@@ -243,7 +248,7 @@ if [ -n "$ZDIR" ]; then
   check "checksum errors repaired by a scrub still warn" grep -q '^WARN|zfs:hctest|ONLINE, .*unrecoverable error, scrubbed' <<<"$l"
   zpool clear hctest
   l=$(zline); echo "    $l"
-  check "after zpool clear: OK again" grep -q '^OK|zfs:hctest|ONLINE, scrubbed 0 day(s) ago' <<<"$l"
+  check "after zpool clear: OK again" grep -qE '^OK\|zfs:hctest\|ONLINE, [0-9]+% free, scrubbed 0 day\(s\) ago' <<<"$l"
   zpool destroy hctest; rm -rf "$ZDIR"
 elif [ -n "${HC_REQUIRE_ZFS:-}" ]; then
   fail "real ZFS required (HC_REQUIRE_ZFS) but no pool could be created"
