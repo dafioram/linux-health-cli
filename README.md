@@ -11,8 +11,8 @@ Debian-family machines: Raspberry Pi (DietPi/Raspbian), mini PCs, home servers.
  ✓ /                58% free space
  ✓ /boot/efi        94% free space
  ✓ /                94% free inodes
- ✓ sda              SMART passed, 41234h on
- ✓ nvme0n1          SMART passed, 3% life used
+ ✓ sda              97% health, SMART passed, 41234h on
+ ✓ nvme0n1          97% health, SMART passed, 3% life used
  ✓ memory           93% available
  ✓ services         no failed units
  ✓ weekly           package files verified clean on 2026-10-18
@@ -79,20 +79,50 @@ Disks show up in two places on the dashboard.
   The kernel remounts a filesystem read-only when it hits errors, so this is CRIT.
 - ext4 error counters, listed together on the `ext4` line by device (e.g. `mmcblk0p2=3`).
 
-**Per physical disk** (labelled by device, e.g. `sda`, `nvme0n1`), from `smartctl -H -A`.
+**Per physical disk** (labelled by device, e.g. `sda`, `nvme0n1`), from `smartctl -i -H -A`.
 If that finds no SMART data, it retries with `-d sat`, which is what most USB-to-SATA
-enclosures need:
+enclosures need. Each SATA and NVMe drive gets a [health score](#drive-health-score):
 
 | Drive | Typical line | Warns when |
 |---|---|---|
-| SATA hard disk | `SMART passed, 41234h on` | ⚠ [bad sectors or read errors](#bad-sectors-and-read-errors) |
-| SATA SSD | `SMART passed, 9120h on, ~93% life left` | ⚠ under 20% life left. Life left is the normalized value of the first of Wear_Leveling_Count, Media_Wearout_Indicator, Percent_Lifetime_Remain, SSD_Life_Left, Remaining_Lifetime_Perc. Bad sectors warn as for hard disks. |
-| NVMe SSD | `SMART passed, 3% life used` | ⚠ 80% or more of rated life used |
-| SAS/SCSI disk | `SMART passed` | health status only |
+| SATA hard disk | `97% health, SMART passed, 41234h on` | ⚠ Caution / ✗ Bad score, or [new bad sectors or read errors](#bad-sectors-and-read-errors) |
+| SATA SSD | `93% health, SMART passed, 9120h on, ~93% life left` | the same. Life left comes from the drive's device statistics, or else the first attribute named like life/wear/endurance. |
+| NVMe SSD | `97% health, SMART passed, 3% life used` | the same |
+| SAS/SCSI disk | `SMART passed` | health status only, no score |
 | USB-SATA enclosure | same as SATA, via `-d sat` | same as SATA |
 | Any drive failing its SMART self-assessment | `SMART health FAILED - back up now` | ✗ always |
 | USB flash drive, VM disk, unsupported USB bridge | `no SMART support (normal for USB flash drives)` | info only |
 | SD card / eMMC (`mmcblk*`) | `SD/eMMC has no SMART; judged by kernel, ext4 and mount checks` | info only |
+
+#### Drive health score
+
+Every SATA or NVMe drive gets a 0-100% health estimate. It uses the attributes that
+Backblaze's drive statistics show predict failure:
+
+- **Starting point:** hard disks start at 100%, SATA SSDs at their own life-remaining
+  figure, NVMe drives at 100 minus "Percentage Used".
+- **Penalties:** each warning sign takes off `min(cap, weight × ln(1 + count))`
+  points, so the first few bad sectors count most. Penalties multiply together
+  (`health = start × Π(1 − penalty/100)`), so the score never drops straight to 0.
+
+| Drive | Penalty: weight, cap |
+|---|---|
+| Hard disk | reallocated sectors 6, 40 · pending sectors 10, 50 · offline uncorrectable 10, 50 · uncorrectable reads 8, 40 · command timeouts 2, 15 · age 2 points a year after 3 years, at most 20 |
+| SATA SSD | retired blocks 3, 30 · uncorrectable reads 8, 40 · pending 10, 50 · offline uncorrectable 10, 50 |
+| NVMe | media errors 8, 40. Capped at 10% on a critical "reliability degraded" or "read-only" warning, at 20% when spare space is below its threshold. |
+
+- **Levels:** 70% and up is Good (✓), 30-69% is Caution (⚠), below 30% is Bad (✗).
+  Pending or offline-uncorrectable sectors, or NVMe media errors, make a drive
+  Caution at best.
+- **Breakdown:** a Caution or Bad drive gets a detail line showing how the score was
+  reached, e.g. `health: base 100% (new drive); -19 reallocated sectors (24); -22
+  pending sectors (8); -8 age (7.0 years)`.
+- **Not scored:** interface CRC errors (usually a cable) are shown but cost no
+  points.
+
+Because an SSD starts from its own life remaining, a healthy SSD with less than 70%
+of its rated life left reads as Caution. The thresholds are the `h >= 70` and
+`h >= 30` in `score_drive` in the collector.
 
 #### Bad sectors and read errors
 

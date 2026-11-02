@@ -160,7 +160,13 @@ fi
 
 section "SMART counters (fake smartctl)"
 FAKEBIN=$(mktemp -d)
-printf '#!/bin/sh\ncat "$FAKE_SMART"\n' > "$FAKEBIN/smartctl"; chmod +x "$FAKEBIN/smartctl"
+cat > "$FAKEBIN/smartctl" <<'EOF'
+#!/bin/sh
+# fake smartctl: $FAKE_SMART for -i -H -A, $FAKE_DEVSTAT (if any) for -l devstat
+case " $* " in *" -l devstat "*) [ -n "${FAKE_DEVSTAT:-}" ] && cat "$FAKE_DEVSTAT"; exit 0 ;; esac
+cat "$FAKE_SMART"
+EOF
+chmod +x "$FAKEBIN/smartctl"
 FAKE_SMART=$(mktemp)
 smart() {  # usage: smart REPORTED_UNCORRECT_RAW [PENDING_RAW] [REALLOCATED_RAW]: fake smartctl -i -H -A output
   cat > "$FAKE_SMART" <<EOF
@@ -177,35 +183,56 @@ EOF
 }
 disk_line() {  # run (or ack, with $1=ack) with the fake smartctl; print the first disk's line
   FAKE_SMART=$FAKE_SMART PATH="$FAKEBIN:$PATH" /usr/local/sbin/healthcheck "${1:-run}"
-  grep -m1 '|SMART passed' "$STATUS"
+  grep -m1 'SMART passed' "$STATUS"
 }
 rm -rf "$STATE/smart-acked"
 if lsblk -dnro TYPE | grep -qx disk; then
   smart 524291                 # the HGST drive: 0x80003, really 3
   l=$(disk_line); echo "    $l"
-  check "packed raw 524291 reads as 3 uncorrectable read errors" grep -qE '^WARN\|[^|]+\|SMART passed, 5157h on, 3 uncorrectable read error\(s\)$' <<<"$l"
+  check "packed raw 524291 reads as 3 uncorrectable read errors (89% health)" grep -qE '^WARN\|[^|]+\|89% health, SMART passed, 5157h on, 3 uncorrectable read error\(s\)$' <<<"$l"
   check "with how to accept them" grep -q 'accept them with: sudo healthcheck ack' "$STATUS"
   l=$(disk_line ack); echo "    $l"
-  check "after ack: OK, shown as old" grep -qE '^OK\|[^|]+\|SMART passed, 5157h on, 3 old uncorrectable read error\(s\) \(acked\)$' <<<"$l"
+  check "after ack: OK, shown as old" grep -qE '^OK\|[^|]+\|89% health, SMART passed, 5157h on, 3 old uncorrectable read error\(s\) \(acked\)$' <<<"$l"
   check "ack is remembered per drive serial" test -s "$STATE/smart-acked/HCTEST123"
   l=$(disk_line); echo "    $l"
   check "still OK on the next run" grep -q '^OK|' <<<"$l"
   smart 524293                 # 0x80005: two more
   l=$(disk_line); echo "    $l"
-  check "an increase warns again, with how many are new" grep -qE '^WARN\|[^|]+\|.*5 uncorrectable read error\(s\) \(2 new\)$' <<<"$l"
+  check "an increase warns again, with how many are new" grep -qE '^WARN\|[^|]+\|86% health, .*5 uncorrectable read error\(s\) \(2 new\)$' <<<"$l"
   smart 524293 8
-  disk_line ack >/dev/null; l=$(grep -m1 '|SMART passed' "$STATUS"); echo "    $l"
-  check "pending sectors warn even after ack" grep -qE '^WARN\|[^|]+\|.*5 old uncorrectable read error\(s\) \(acked\), 8 pending \(unreadable\) sector\(s\)$' <<<"$l"
+  disk_line ack >/dev/null; l=$(grep -m1 'SMART passed' "$STATUS"); echo "    $l"
+  check "pending sectors warn even after ack" grep -qE '^WARN\|[^|]+\|67% health, .*5 old uncorrectable read error\(s\) \(acked\), 8 pending \(unreadable\) sector\(s\)$' <<<"$l"
   rm -rf "$STATE/smart-acked"
   smart 12 0 7                 # a plain count, as most drives report it
   l=$(disk_line); echo "    $l"
-  check "plain counts are shown as-is" grep -qE '\|SMART passed, 5157h on, 7 reallocated sector\(s\), 12 uncorrectable read error\(s\)$' <<<"$l"
+  check "plain counts are shown as-is" grep -qE '\|70% health, SMART passed, 5157h on, 7 reallocated sector\(s\), 12 uncorrectable read error\(s\)$' <<<"$l"
   smart 65536                  # low 16 bits are 0: can't decode, so don't hide it
   l=$(disk_line); echo "    $l"
-  check "undecodable large value is shown raw, not hidden" grep -q '65536 uncorrectable read error' <<<"$l"
+  check "undecodable large value is shown raw, not hidden" grep -qE '^WARN\|[^|]+\|60% health, .*65536 uncorrectable read error' <<<"$l"
   smart 0
   l=$(disk_line); echo "    $l"
-  check "clean drive: OK" grep -qE '^OK\|[^|]+\|SMART passed, 5157h on$' <<<"$l"
+  check "clean drive: OK" grep -qE '^OK\|[^|]+\|100% health, SMART passed, 5157h on$' <<<"$l"
+  # health score cases (values cross-checked against drivehealth.py)
+  printf 'Serial Number:    HCOLD\nRotation Rate:    7200 rpm\nSMART overall-health self-assessment test result: PASSED\n  9 Power_On_Hours          0x0012   020   020   000    Old_age   Always       -       61000\n' > "$FAKE_SMART"
+  l=$(disk_line); echo "    $l"
+  check "old HDD: age penalty after 3 years" grep -qE '^OK\|[^|]+\|92% health, SMART passed, 61000h on$' <<<"$l"
+  printf 'Serial Number:    HCSSD\nRotation Rate:    Solid State Device\nSMART overall-health self-assessment test result: PASSED\n  9 Power_On_Hours          0x0012   099   099   000    Old_age   Always       -       9120\n177 Wear_Leveling_Count     0x0013   099   099   000    Pre-fail  Always       -       5\n' > "$FAKE_SMART"
+  FAKE_DEVSTAT=$(mktemp); echo '0x07  0x008  1              40  N--  Percentage Used Endurance Indicator' > "$FAKE_DEVSTAT"
+  l=$(FAKE_DEVSTAT=$FAKE_DEVSTAT disk_line); echo "    $l"
+  check "SATA SSD: device statistics wear wins over the attribute" grep -qE '^WARN\|[^|]+\|60% health, SMART passed, 9120h on, ~60% life left$' <<<"$l"
+  check "and a Caution drive shows how the score was made" grep -q 'health: base 60% (device statistics)' "$STATUS"
+  l=$(disk_line); echo "    $l"
+  check "SATA SSD without device statistics: wear attribute" grep -qE '^OK\|[^|]+\|99% health, SMART passed, 9120h on, ~99% life left$' <<<"$l"
+  rm -f "$FAKE_DEVSTAT"
+  nvme_out() {  # usage: nvme_out USED MEDIA_ERRORS CRITICAL_WARNING
+    printf 'Serial Number:                      HCNVME\nSMART overall-health self-assessment test result: PASSED\nCritical Warning:                   %s\nAvailable Spare:                    100%%\nAvailable Spare Threshold:          10%%\nPercentage Used:                    %s%%\nMedia and Data Integrity Errors:    %s\n' "$3" "$1" "$2" > "$FAKE_SMART"
+  }
+  nvme_out 3 0 0x00;  l=$(disk_line); echo "    $l"
+  check "NVMe: 100 - Percentage Used" grep -qE '^OK\|[^|]+\|97% health, SMART passed, 3% life used$' <<<"$l"
+  nvme_out 10 2 0x00; l=$(disk_line); echo "    $l"
+  check "NVMe media errors: penalty, no better than Caution" grep -qE '^WARN\|[^|]+\|82% health, SMART passed, 10% life used, 2 media error\(s\)$' <<<"$l"
+  nvme_out 5 0 0x04;  l=$(disk_line); echo "    $l"
+  check "NVMe critical warning (reliability degraded): capped at 10%, Bad" grep -qE '^CRIT\|[^|]+\|10% health, ' <<<"$l"
 else
   echo "  skip SMART counter checks (no disks listed by lsblk)"
 fi

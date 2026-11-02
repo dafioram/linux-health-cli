@@ -258,31 +258,126 @@ usage_check inodes ipcent
 
 # --- Drives ---
 attr_of() { awk -v a="$1" '$1==a {print $2; exit}' <<<"$2"; }   # value of attribute $1 in "name value" lines $2
+count_of() { local v; v=$(attr_of "$1" "$2"); echo "${v:-0}"; }    # the same, 0 when the drive doesn't report it
+nvme_field() { sed -n "s/^$1: *//p" <<<"$2" | tr -d ',%' | awk '{print $1; exit}'; }   # e.g. "Percentage Used: 3%" -> 3
+
+# Drive health score (0-100%), after drivehealth.py: HDDs start at 100%, SATA SSDs at their
+# life remaining, NVMe at 100 - Percentage Used. Failure-predictive counters subtract
+# log-scaled penalties, min(cap, weight * ln(1 + count)), which combine multiplicatively.
+# Input lines: "base PCT source", "pen COUNT WEIGHT CAP label", "age YEARS", "cap PCT reason",
+# "force" (no better than Caution). Prints "health|Good/Caution/Bad|breakdown".
+score_drive() {
+  awk '
+    $1 == "base"  {b = $2; src = $0; sub(/^base [^ ]+ /, "", src)}
+    $1 == "pen"   {if ($2 > 0) {p = $3 * log(1 + $2); if (p > $4) p = $4
+                     l = $0; sub(/^pen [^ ]+ [^ ]+ [^ ]+ /, "", l)
+                     pen[++k] = p; why = why sprintf("; -%.0f %s (%s)", p, l, $2)}}
+    $1 == "age"   {p = ($2 - 3) * 2; if (p > 20) p = 20      # 2 points a year after 3 years, at most 20
+                   if (p > 0) {pen[++k] = p; why = why sprintf("; -%.0f age (%.1f years)", p, $2)}}
+    $1 == "cap"   {if (capv == "" || $2 < capv) {capv = $2; r = $0; sub(/^cap [^ ]+ /, "", r); capr = r}}
+    $1 == "force" {force = 1}
+    END {
+      h = b; for (i = 1; i <= k; i++) h *= 1 - pen[i] / 100
+      if (capv != "" && h > capv) {h = capv; why = why "; capped at " capv "%: " capr}
+      h = sprintf("%.0f", h) + 0
+      s = h >= 70 ? "Good" : (h >= 30 ? "Caution" : "Bad")
+      if (force && s == "Good") s = "Caution"
+      printf "%d|%s|base %d%% (%s)%s\n", h, s, b, src, why
+    }'
+}
+worse() {  # worse of two dashboard levels
+  local r1 r2
+  case $1 in CRIT) r1=3 ;; WARN) r1=2 ;; INFO) r1=1 ;; *) r1=0 ;; esac
+  case $2 in CRIT) r2=3 ;; WARN) r2=2 ;; INFO) r2=1 ;; *) r2=0 ;; esac
+  if [ "$r1" -ge "$r2" ]; then echo "$1"; else echo "$2"; fi
+}
 smart_check() {
-  local dev=/dev/$1 out wear used hrs msg lvl=OK key vals acked spec a what n n0 unacked=0
+  local dev=/dev/$1 out dopt=() kind wear wsrc ds used hrs msg lvl=OK key vals acked spec a what n n0 unacked=0
+  local sc health status why cw spare thresh crc
   out=$(timeout 30 smartctl -i -H -A "$dev" 2>&1)
-  grep -qE 'overall-health|SMART Health Status' <<<"$out" || out=$(timeout 30 smartctl -d sat -i -H -A "$dev" 2>&1)
+  if ! grep -qE 'overall-health|SMART Health Status' <<<"$out"; then
+    dopt=(-d sat); out=$(timeout 30 smartctl -d sat -i -H -A "$dev" 2>&1)
+  fi
   if ! grep -qE 'overall-health|SMART Health Status' <<<"$out"; then
     add INFO "$1" "no SMART support (normal for USB flash drives)"; return
   fi
   if grep -qE 'overall-health.*FAILED|Health Status: (FAILED|FAILING)' <<<"$out"; then
     add CRIT "$1" "SMART health FAILED - back up now"; return
   fi
-  # sector/error counters as "name value"; some firmware (e.g. HGST) packs extra fields above the
-  # low 16 bits of the raw value, so 524291 (0x80003) means 3. If the low bits are 0, keep the raw.
-  vals=$(awk '$2 ~ /^(Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable|Reported_Uncorrect)$/ {
-    n = $10 + 0; if (n > 65535 && n % 65536 > 0) n = n % 65536; print $2, n }' <<<"$out")
+  # ATA counters as "name value". Some firmware packs extra fields into the raw value:
+  # HGST's 524291 (0x80003) means 3, so above 65535 use the low 16 bits (keep the raw if those
+  # are 0, or its low 32 bits past that). Command_Timeout is always three packed 16-bit counters.
+  vals=$(awk '$1 ~ /^[0-9]+$/ && $3 ~ /^0x/ && $2 ~ /^(Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable|Reported_Uncorrect|Command_Timeout|UDMA_CRC_Error_Count)$/ {
+    n = $10 + 0
+    if (n > 65535) { if ($2 == "Command_Timeout" || n % 65536 > 0) n = n % 65536; else if (n > 4294967295) n = n % 4294967296 }
+    printf "%s %d\n", $2, n }' <<<"$out")
   key=$(awk -F: '/^Serial [Nn]umber:/ {gsub(/[^A-Za-z0-9._-]/, "", $2); print $2; exit}' <<<"$out")
   key=$STATE/smart-acked/${key:-$1}
   if [ "${ACKING:-0}" = 1 ]; then mkdir -p "${key%/*}" && printf '%s\n' "$vals" > "$key"; fi
   acked=$(cat "$key" 2>/dev/null)
-  wear=$(awk '$2 ~ /^(Wear_Leveling_Count|Media_Wearout_Indicator|Percent_Lifetime_Remain|SSD_Life_Left|Remaining_Lifetime_Perc)$/ {print $4+0; exit}' <<<"$out")
-  used=$(awk -F: '/Percentage Used/ {gsub(/[ %]/,"",$2); print $2}' <<<"$out")
-  hrs=$(awk '$2=="Power_On_Hours" {print $10+0; exit}' <<<"$out")
+  hrs=$(awk '$2 == "Power_On_Hours" {print $10 + 0; exit}' <<<"$out")
+  # SSD wear: an attribute named like life/wear/endurance with a 0-100 normalized value
+  wear=$(awk '$1 ~ /^[0-9]+$/ && $3 ~ /^0x/ && tolower($2) ~ /life|wear|endurance/ && $4 ~ /^[0-9]+$/ && $4 + 0 <= 100 {
+    print $4 + 0, "attribute", $1, $2; exit}' <<<"$out")
+  if grep -q '^Percentage Used:' <<<"$out"; then kind=NVMe
+  else
+    case $(sed -n 's/^Rotation Rate: *//p' <<<"$out") in
+      "Solid State"*) kind=SSD ;;
+      *rpm*)          kind=HDD ;;
+      *)              kind=HDD; [ -n "$wear" ] && kind=SSD ;;
+    esac
+  fi
+  # the score: inputs for score_drive, one per line
+  if [ "$kind" = NVMe ]; then
+    used=$(nvme_field 'Percentage Used' "$out"); cw=$(nvme_field 'Critical Warning' "$out")
+    spare=$(nvme_field 'Available Spare' "$out"); thresh=$(nvme_field 'Available Spare Threshold' "$out")
+    n=$(nvme_field 'Media and Data Integrity Errors' "$out")
+    sc="base $((100 - ${used:-0})) Percentage Used = ${used:-0}%
+pen ${n:-0} 8 40 media errors"
+    if [ "${n:-0}" -gt 0 ]; then sc="$sc
+force"; fi   # media errors: no better than Caution
+    if [[ $cw =~ ^0x[0-9a-fA-F]+$ ]] && (( cw & 0x0C )); then sc="$sc
+cap 10 critical warning: reliability degraded or read-only"
+    elif { [[ $cw =~ ^0x[0-9a-fA-F]+$ ]] && (( cw & 0x01 )); } || { [ -n "$spare" ] && [ -n "$thresh" ] && [ "$spare" -lt "$thresh" ]; }; then sc="$sc
+cap 20 available spare ${spare}% below threshold ${thresh}%"
+    fi
+  elif [ -n "$vals" ] || grep -qE '^ *[0-9]+ [A-Za-z_]+ +0x' <<<"$out"; then
+    if [ "$kind" = SSD ]; then
+      ds=$(timeout 30 smartctl "${dopt[@]}" -l devstat "$dev" 2>/dev/null | awk '/Percentage Used Endurance Indicator/ && $4 ~ /^[0-9]+$/ {print $4; exit}')
+      if [ -n "$ds" ]; then wear=$(( ds > 100 ? 0 : 100 - ds )); wsrc="device statistics"
+      elif [ -n "$wear" ]; then wsrc=${wear#* }; wear=${wear%% *}
+      fi
+      sc="base ${wear:-100} ${wsrc:-no wear indicator found; assuming 100% life}
+pen $(count_of Reallocated_Sector_Ct "$vals") 3 30 retired/reallocated blocks
+pen $(count_of Reported_Uncorrect "$vals") 8 40 uncorrectable reads
+pen $(count_of Current_Pending_Sector "$vals") 10 50 pending sectors
+pen $(count_of Offline_Uncorrectable "$vals") 10 50 offline uncorrectable"
+    else
+      wear=""
+      sc="base 100 new drive
+pen $(count_of Reallocated_Sector_Ct "$vals") 6 40 reallocated sectors
+pen $(count_of Current_Pending_Sector "$vals") 10 50 pending sectors
+pen $(count_of Offline_Uncorrectable "$vals") 10 50 offline uncorrectable
+pen $(count_of Reported_Uncorrect "$vals") 8 40 uncorrectable reads
+pen $(count_of Command_Timeout "$vals") 2 15 command timeouts"
+      [ -n "$hrs" ] && sc="$sc
+age $(awk -v h="$hrs" 'BEGIN {printf "%.2f", h / 8766}')"
+    fi
+    if [ "$(count_of Current_Pending_Sector "$vals")" -gt 0 ] || [ "$(count_of Offline_Uncorrectable "$vals")" -gt 0 ]; then
+      sc="$sc
+force"   # unreadable sectors: no better than Caution
+    fi
+  fi
   msg="SMART passed"
+  if [ -n "$sc" ]; then
+    IFS='|' read -r health status why < <(score_drive <<<"$sc")
+    msg="$health% health, $msg"
+    case $status in Good) ;; Caution) lvl=WARN ;; *) lvl=CRIT ;; esac
+  fi
   [ -n "$hrs" ]  && msg="$msg, ${hrs}h on"
-  [ -n "$wear" ] && { msg="$msg, ~${wear}% life left"; [ "$wear" -lt 20 ] && lvl=WARN; }
-  [ -n "$used" ] && { msg="$msg, ${used}% life used"; [ "$used" -ge 80 ] && lvl=WARN; }
+  [ "$kind" = SSD ] && [ -n "$wear" ] && msg="$msg, ~${wear}% life left"
+  [ "$kind" = NVMe ] && [ -n "$used" ] && msg="$msg, ${used}% life used"
+  if [ "$kind" = NVMe ] && [ "${n:-0}" -gt 0 ]; then msg="$msg, $n media error(s)"; fi
   # lifetime counts never go down: warn until acked, then only when they grow
   for spec in "Reallocated_Sector_Ct|reallocated sector(s)" "Reported_Uncorrect|uncorrectable read error(s)"; do
     a=${spec%%|*}; what=${spec#*|}
@@ -290,7 +385,7 @@ smart_check() {
     n0=$(attr_of "$a" "$acked"); n0=${n0:-0}
     if [ "$n" -gt "$n0" ]; then
       msg="$msg, $n $what"; [ "$n0" -gt 0 ] && msg="$msg ($((n - n0)) new)"
-      lvl=WARN; unacked=1
+      lvl=$(worse "$lvl" WARN); unacked=1
     else
       msg="$msg, $n old $what (acked)"
     fi
@@ -298,9 +393,12 @@ smart_check() {
   # sectors the drive can't read right now: always a warning
   for spec in "Current_Pending_Sector|pending (unreadable) sector(s)" "Offline_Uncorrectable|offline-uncorrectable sector(s)"; do
     a=${spec%%|*}; what=${spec#*|}
-    n=$(attr_of "$a" "$vals"); [ "${n:-0}" -gt 0 ] && { msg="$msg, $n $what"; lvl=WARN; }
+    n=$(attr_of "$a" "$vals"); [ "${n:-0}" -gt 0 ] && { msg="$msg, $n $what"; lvl=$(worse "$lvl" WARN); }
   done
+  crc=$(attr_of UDMA_CRC_Error_Count "$vals")
+  [ "${crc:-0}" -gt 0 ] && msg="$msg, $crc interface CRC error(s) (check the cable)"
   add "$lvl" "$1" "$msg"
+  [ -n "$sc" ] && [ "$status" != Good ] && add DETAIL "" "health: $why"
   [ "$unacked" = 1 ] && add DETAIL "" "lifetime counts never go down; once checked, accept them with: sudo healthcheck ack"
   return 0
 }
